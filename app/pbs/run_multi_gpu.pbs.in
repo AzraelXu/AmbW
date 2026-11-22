@@ -1,0 +1,84 @@
+#!/bin/bash
+# =============================================================================
+# 整节点多副本 fallback：节点有 N 张 GPU，就在 GPU 0..N-1 上各跑一个副本。
+#
+# 与其他集群的差异：只需改 config.sh 的 PBS_GPUS_PER_NODE 和 PBS_TWO_GPU_PPN；
+# 本模板不写死 GPU 数量，按 REP_DIRS 的个数启动，最多 GPUS_PER_NODE 个。
+#
+# 注意：这不是"申请 gpus=N 的 8 核作业"；整节点用 ppn=<节点核数>，
+#       让 Torque 不把节点分给别的作业。
+# =============================================================================
+#PBS -N {{JOB_NAME}}
+#PBS -q {{QUEUE}}
+#PBS -l nodes={{NODES}}:ppn={{PPN}}
+#PBS -l walltime={{WALLTIME}}
+#PBS -j {{JOIN}}
+#PBS -o {{LOG_DIR}}
+#PBS -m {{MAIL}}
+
+set -o pipefail
+
+# 本集群 Torque 未把 #PBS -o 的输出写回 NFS；作业自身再落一份日志到 LOG_DIR。
+exec >>"{{LOG_DIR}}{{JOB_NAME}}.o${PBS_JOBID%%.*}" 2>&1
+
+cd "$PBS_O_WORKDIR" || { echo "无法进入 PBS_O_WORKDIR=$PBS_O_WORKDIR"; exit 1; }
+# 清除继承的 OpenMPI 库路径，避免与 {{AMBER_SH}} 的 OpenMPI 版本混用；
+# 混用不同 libmpi 会让 mpirun/sander.MPI 挂起。
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+  LD_LIBRARY_PATH=$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' \
+    | grep -v -i 'openmpi' | paste -sd: - || true)
+  export LD_LIBRARY_PATH
+fi
+# amber.sh 会读取 LD_LIBRARY_PATH/PERL5LIB/PYTHONPATH；这些变量在 qsub 环境中
+# 可能未导出，set -u 会让 source 直接退出。source 期间临时关闭 nounset。
+set +u
+source "{{AMBER_SH}}" || { echo "source {{AMBER_SH}} 失败"; exit 1; }
+set -u
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+REP_DIRS="{{REP_DIRS}}"
+GPUS_PER_NODE={{GPUS_PER_NODE}}
+STAGE="{{STAGE}}"
+PREV="{{PREV}}"
+TOP="{{TOP}}"
+REF="{{REF}}"
+
+[ "$GPUS_PER_NODE" -ge 1 ] 2>/dev/null || { echo "GPUS_PER_NODE 非法: $GPUS_PER_NODE"; exit 1; }
+n=0
+for dir in $REP_DIRS; do
+  n=$((n+1))
+  [ -d "$dir" ] || { echo "副本目录不存在: $dir"; exit 1; }
+  [ -s "$dir/$TOP" ] || { echo "缺少 $dir/$TOP"; exit 1; }
+  [ -s "$dir/$PREV" ] || { echo "缺少 $dir/$PREV"; exit 1; }
+done
+[ "$n" -ge 1 ] || { echo "REP_DIRS 为空"; exit 1; }
+[ "$n" -le "$GPUS_PER_NODE" ] || {
+  echo "REP_DIRS 有 $n 个副本，但 GPUS_PER_NODE=$GPUS_PER_NODE"; exit 1; }
+
+echo "HOST=$(hostname) JOB=$PBS_JOBID GPUS_PER_NODE=$GPUS_PER_NODE REPLICAS=$n"
+nvidia-smi -L 2>&1 | head -8 || true
+
+run_one() {
+  local dir="$1" gpu="$2"
+  cd "$dir" || return 1
+  echo "=== GPU $gpu $dir $STAGE $(date) ==="
+  CUDA_VISIBLE_DEVICES="$gpu" pmemd.cuda -O \
+    -i "$STAGE.in" -o "$STAGE.out" -p "$TOP" \
+    -c "$PREV" -ref "$REF" -r "$STAGE.rst7" -x "$STAGE.nc" \
+    -inf "$STAGE.mdinfo" -l "$STAGE.log"
+}
+
+pids=()
+gpu=0
+for dir in $REP_DIRS; do
+  run_one "$dir" "$gpu" &
+  pids+=($!)
+  gpu=$((gpu+1))
+done
+
+status=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || status=1
+done
+echo "all replicas finished; status=$status"
+exit "$status"

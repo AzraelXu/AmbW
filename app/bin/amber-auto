@@ -1,0 +1,1559 @@
+#!/opt/software/amber_general_workflow/envs/analysis/bin/python
+"""amber-auto: one-command Amber MD system building and cluster submission.
+
+Typical use:
+  amber-auto run complex1.pdb complex2.pdb
+  amber-auto build complex1.pdb --no-submit
+  amber-auto status --queue
+  amber-auto report
+  amber-auto resume
+
+The tool inspects each complex, prepares protein/ligand coordinates, builds an
+Amber topology with tleap, generates MD inputs, and submits an equil -> prod ->
+post (cpptraj + analysis + MM-GBSA) Torque dependency chain. It reuses the
+tested scripts in this repository and leaves the legacy amber-kit workflow
+available for advanced use.
+"""
+import argparse
+import copy
+import csv
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+
+def _reexec_with_newer_python():
+    """Re-exec under Python >= 3.7 when the shebang found an older python3.
+
+    Some clusters put /usr/bin/python3 (3.6 on RHEL7) first in PATH while a
+    newer interpreter lives in a conda install. Conda's PATH entry can contain
+    a literal '~' (bash expands it, execvp in a shebang does not), so also
+    expand PATH entries here.
+    """
+    if sys.version_info >= (3, 7):
+        return
+    versioned = ("python3.13", "python3.12", "python3.11", "python3.10",
+                 "python3.9", "python3.8", "python3.7")
+    candidates = []
+    for name in versioned:
+        exe = shutil.which(name)
+        if exe:
+            candidates.append(exe)
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        entry = os.path.expanduser(entry)
+        if not entry:
+            continue
+        candidates.append(os.path.join(entry, "python3"))
+        candidates += [os.path.join(entry, name) for name in versioned]
+    candidates += [
+        os.path.expanduser("~/Software/anaconda3/bin/python3"),
+        os.path.expanduser("~/anaconda3/bin/python3"),
+        "/opt/conda/bin/python3",
+        "/usr/local/bin/python3",
+    ]
+    seen = {os.path.realpath(sys.executable)}
+    script = os.path.abspath(__file__)
+    for exe in candidates:
+        if not (exe and os.access(exe, os.X_OK)):
+            continue
+        real = os.path.realpath(exe)
+        if real in seen:
+            continue
+        seen.add(real)
+        probe = subprocess.run(
+            [exe, "-c",
+             "import sys; raise SystemExit(0 if sys.version_info >= (3, 7) else 1)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if probe.returncode == 0:
+            os.execv(exe, [exe, script] + sys.argv[1:])
+    sys.exit("amber-auto requires Python >= 3.7 (found %s); put a newer "
+             "python3 in PATH" % sys.version.split()[0])
+
+
+_reexec_with_newer_python()
+
+KIT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SCRIPTS = os.path.join(KIT_DIR, "scripts")
+PBS_DIR = os.path.join(KIT_DIR, "pbs")
+
+DEFAULTS = {
+    "amber_sh": "/opt/software/amber22/amber.sh",
+    "rdkit_python": "/opt/software/amber_general_workflow/envs/analysis/bin/python",
+    "py_qc": "/opt/software/amber_general_workflow/envs/qc/bin/python",
+    "py_analysis": "/opt/software/amber_general_workflow/envs/analysis/bin/python",
+    "obabel": "/opt/schrodinger2021-2/utilities/obabel",
+    "campaign": "./amber-campaign",
+    "ff": "ff19SB",
+    "solvent": "explicit",
+    "water": "opc",
+    "box": "oct",
+    "pad": 10.0,
+    "cation": "Na+",
+    "anion": "Cl-",
+    "radii": "mbondi2",
+    "igb": 5,
+    "heat_ns": 2.0,
+    "release_stages": 10,
+    "release_ns": 1.0,
+    "prod_ns": 100.0,
+    "prod_chunks": 4,
+    "dt": 0.002,
+    "traj_interval_ps": 10.0,
+    "replicas": 1,
+    "seed_base": 20261001,
+    "strip_mask": ":WAT,Na+,Cl-,K+",
+    "ph": "7.4",
+    "no_reduce": False,
+    "mmpbsa": True,
+    "mmpbsa_method": "gb",
+    "mmpbsa_igb": 5,
+    "mmpbsa_saltcon": 0.12,
+    "mmpbsa_interval": 100,
+    "pbs_queue": "batch",
+    "pbs_nodes": "1",
+    "ppn": 8,
+    "gpus": 1,
+    "equil_walltime": "24:00:00",
+    "prod_walltime": "24:00:00",
+    "post_walltime": "12:00:00",
+    "pbs_join": "oe",
+    "pbs_mail": "n",
+}
+
+VERBOSE = False
+
+
+class BuildError(Exception):
+    pass
+
+
+class SubmissionError(Exception):
+    pass
+
+
+def die(msg, code=2):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def note(msg):
+    print(f"[amber-auto] {msg}", file=sys.stderr)
+
+
+def now():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def tail(text, n=30):
+    lines = (text or "").splitlines()
+    return "\n".join(lines[-n:])
+
+
+def run(cmd, cwd=None, check=False, quiet=False, env=None):
+    if VERBOSE and not quiet:
+        print("+ " + " ".join(shlex.quote(str(x)) for x in cmd), file=sys.stderr)
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+    except OSError as exc:
+        proc = subprocess.CompletedProcess(
+            cmd, 127, stdout=f"command not found or not executable: {exc}")
+    if check and proc.returncode != 0:
+        raise BuildError(
+            f"command failed ({proc.returncode}): {' '.join(shlex.quote(str(x)) for x in cmd)}\n"
+            + tail(proc.stdout))
+    return proc
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def deep_merge(dst, src):
+    for key, value in src.items():
+        if isinstance(value, dict) and isinstance(dst.get(key), dict):
+            deep_merge(dst[key], value)
+        else:
+            dst[key] = value
+    return dst
+
+
+def load_config(args):
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg_path = (getattr(args, "config", None)
+                or os.environ.get("AMBER_AUTO_CONFIG"))
+    if not cfg_path:
+        cfg_path = os.path.join(KIT_DIR, "config", "auto.example.json")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, encoding="utf-8") as fh:
+                deep_merge(cfg, json.load(fh))
+        except Exception as exc:
+            die(f"cannot read config {cfg_path}: {exc}")
+    # CLI overrides
+    mapping = {
+        "amber_sh": "amber_sh", "rdkit_python": "rdkit_python",
+        "py_qc": "py_qc", "py_analysis": "py_analysis", "obabel": "obabel",
+        "ff": "ff", "solvent": "solvent", "water": "water", "box": "box",
+        "pad": "pad", "cation": "cation", "anion": "anion",
+        "radii": "radii", "igb": "igb", "heat_ns": "heat_ns",
+        "release_stages": "release_stages", "release_ns": "release_ns",
+        "prod_ns": "prod_ns", "prod_chunks": "prod_chunks", "dt": "dt",
+        "traj_interval_ps": "traj_interval_ps", "replicas": "replicas",
+        "seed_base": "seed_base", "pbs_queue": "pbs_queue",
+        "pbs_nodes": "pbs_nodes", "ppn": "ppn",
+        "gpus": "gpus", "equil_walltime": "equil_walltime",
+        "prod_walltime": "prod_walltime", "post_walltime": "post_walltime",
+        "mmpbsa_method": "mmpbsa_method", "mmpbsa_igb": "mmpbsa_igb",
+        "mmpbsa_saltcon": "mmpbsa_saltcon", "mmpbsa_interval": "mmpbsa_interval",
+        "ph": "ph",
+    }
+    for arg_name, key in mapping.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            cfg[key] = value
+    if getattr(args, "campaign", None):
+        cfg["campaign"] = args.campaign
+    if getattr(args, "no_mmpbsa", False):
+        cfg["mmpbsa"] = False
+    if getattr(args, "no_reduce", False):
+        cfg["no_reduce"] = True
+    if getattr(args, "mmpbsa_igb", None) is not None:
+        cfg["mmpbsa_igb"] = args.mmpbsa_igb
+    # Friendly pairing when the user changes only one half of a standard pair.
+    if getattr(args, "ff", None) == "ff14SB" and getattr(args, "water", None) is None:
+        cfg["water"] = "tip3p"
+    if getattr(args, "radii", None) is None and getattr(args, "igb", None) is not None:
+        cfg["radii"] = "mbondi3" if int(cfg["igb"]) == 8 else "mbondi2"
+    return cfg
+
+
+def validate_config(cfg):
+    if int(cfg["replicas"]) < 1:
+        die("--replicas must be >= 1")
+    if int(cfg["prod_chunks"]) < 1:
+        die("--prod-chunks must be >= 1")
+    if float(cfg["prod_ns"]) <= 0:
+        die("--prod-ns must be > 0")
+    if float(cfg["heat_ns"]) <= 0:
+        die("--heat-ns must be > 0")
+    if float(cfg["dt"]) <= 0:
+        die("--dt must be > 0")
+    if float(cfg["pad"]) <= 0:
+        die("--pad must be > 0")
+    if cfg["solvent"] not in ("explicit", "implicit"):
+        die("--solvent must be explicit or implicit")
+
+
+def campaign_root(cfg):
+    root = os.path.abspath(cfg["campaign"])
+    os.makedirs(root, exist_ok=True)
+    for sub in ("complexes", "logs", "report", "inspections"):
+        os.makedirs(os.path.join(root, sub), exist_ok=True)
+    return root
+
+
+def state_path(root):
+    return os.path.join(root, "campaign.json")
+
+
+def load_state(root):
+    path = state_path(root)
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception as exc:
+            die(f"cannot read campaign state {path}: {exc}")
+    return {
+        "schema_version": 1,
+        "generator": "amber-auto",
+        "created_at": now(),
+        "campaign_root": root,
+        "config": {},
+        "complexes": [],
+    }
+
+
+def save_state(root, state):
+    path = state_path(root)
+    lock_path = os.path.join(root, ".campaign.lock")
+    state["updated_at"] = now()
+    with open(lock_path, "w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+
+
+def label_for(pdb, explicit=None):
+    if explicit:
+        base = explicit
+    else:
+        base = os.path.splitext(os.path.basename(pdb))[0]
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("_.-")
+    return (base or "complex")[:40]
+
+
+def unique_label(root, state, pdb, explicit=None, force=False):
+    base = label_for(pdb, explicit)
+    used = {e["label"] for e in state.get("complexes", [])}
+    if explicit and explicit in used and not force:
+        raise BuildError(f"--name {explicit} already exists in this campaign; "
+                         "use --force to rebuild it")
+    if force and explicit and explicit in used:
+        return explicit
+    if force and not explicit and base in used:
+        return base
+    candidate = base
+    n = 2
+    while candidate in used or os.path.isdir(os.path.join(root, "complexes", candidate)):
+        candidate = f"{base[:36]}_{n}"
+        n += 1
+    return candidate
+
+
+def rel(path, start):
+    return os.path.relpath(path, start)
+
+
+# ---------------------------------------------------------------------------
+# inspection / preparation / building
+# ---------------------------------------------------------------------------
+def inspect_one(pdb, out_json, args, cfg):
+    cmd = [sys.executable, "-I", os.path.join(SCRIPTS, "inspect_complex.py"),
+           "--pdb", pdb, "--json-out", out_json, "--quiet",
+           "--model", str(args.model), "--altloc", args.altloc,
+           "--type", args.type,
+           "--ss-cutoff", str(args.ss_cutoff),
+           "--cn-break-cutoff", str(args.cn_break_cutoff)]
+    for flag, value in (
+            ("--ligand", args.ligand),
+            ("--receptor-chains", args.receptor_chains),
+            ("--partner-chains", args.partner_chains)):
+        if value:
+            cmd += [flag, value]
+    for flag, value in (
+            ("--drop-glycans", args.drop_glycans),
+            ("--drop-metals", args.drop_metals),
+            ("--drop-modified", args.drop_modified),
+            ("--drop-unknown-hetatm", args.drop_unknown_hetatm),
+            ("--drop-other-ligands", args.drop_other_ligands),
+            ("--strict-gaps", args.strict_gaps)):
+        if value:
+            cmd.append(flag)
+    proc = run(cmd)
+    if proc.returncode != 0:
+        raise BuildError("inspection failed:\n" + tail(proc.stdout))
+    with open(out_json, encoding="utf-8") as fh:
+        data = json.load(fh)
+    errors = data.get("classification", {}).get("errors", [])
+    if errors:
+        messages = "\n".join(f"[{e['code']}] {e['message']}" for e in errors)
+        raise BuildError("complex inspection reported errors:\n" + messages)
+    return data
+
+
+def prepare_one(pdb, components, outdir, args, cfg):
+    cmd = [sys.executable, "-I", os.path.join(SCRIPTS, "prepare_complex.py"),
+           "--pdb", pdb, "--components", components, "--outdir", outdir,
+           "--model", str(args.model), "--altloc", args.altloc,
+           "--type", args.type,
+           "--ligand-resname", args.ligand_resname,
+           "--ph", str(cfg["ph"]),
+           "--rdkit-python", cfg["rdkit_python"],
+           "--obabel", cfg["obabel"],
+           "--amber-sh", cfg["amber_sh"],
+           "--ss-cutoff", str(args.ss_cutoff),
+           "--cn-break-cutoff", str(args.cn_break_cutoff),
+           "--force"]
+    if args.ligand:
+        cmd += ["--ligand", args.ligand]
+    if args.charge is not None:
+        cmd += ["--charge", str(args.charge)]
+    if args.ligand_smiles:
+        cmd += ["--ligand-smiles", args.ligand_smiles]
+    if cfg.get("no_reduce"):
+        cmd.append("--no-reduce")
+    for flag, value in (
+            ("--drop-glycans", args.drop_glycans),
+            ("--drop-metals", args.drop_metals),
+            ("--drop-modified", args.drop_modified),
+            ("--drop-unknown-hetatm", args.drop_unknown_hetatm),
+            ("--drop-other-ligands", args.drop_other_ligands),
+            ("--strict-gaps", args.strict_gaps)):
+        if value:
+            cmd.append(flag)
+    proc = run(cmd)
+    if proc.returncode != 0:
+        raise BuildError("preparation failed:\n" + tail(proc.stdout))
+    manifest_path = os.path.join(outdir, "prepare_manifest.json")
+    with open(manifest_path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def amber_env(cfg):
+    """Environment for child Amber shell scripts.
+
+    build_system.sh / param_ligand.sh source $AMBER_MD_AMBER_SH when their
+    executables are not already in PATH, so amber-auto works without the
+    caller having sourced amber.sh first.
+    """
+    env = os.environ.copy()
+    env["AMBER_MD_AMBER_SH"] = cfg["amber_sh"]
+    return env
+
+
+def param_ligand(manifest, cdir, cfg, force=True):
+    prep = manifest["prepared"]
+    ligdir = os.path.join(cdir, "ligands", manifest["ligand"].get("resname", "LIG"))
+    cmd = ["bash", os.path.join(SCRIPTS, "param_ligand.sh"),
+           "--pdb", prep["ligand_prepared"],
+           "--charge", str(manifest["ligand"]["charge"]),
+           "--resname", manifest["ligand"].get("resname", "LIG"),
+           "--gaff", "gaff2", "--outdir", ligdir]
+    if force:
+        cmd.append("--force")
+    proc = run(cmd, env=amber_env(cfg))
+    if proc.returncode != 0:
+        raise BuildError("ligand parameterization failed:\n" + tail(proc.stdout))
+    return ligdir
+
+
+def build_system(manifest, cdir, cfg, args):
+    entry_type = manifest["type"]
+    ligand = entry_type == "protein-ligand"
+    partner = entry_type in ("protein-peptide", "protein-antibody", "protein-protein")
+    apo = entry_type == "apo-protein"
+    if not (ligand or partner or apo):
+        raise BuildError(f"unsupported system type: {entry_type}")
+    top_name = "apo" if apo else "complex"
+    outdir = os.path.join(cdir, "systems", os.path.basename(cdir))
+    prep = manifest["prepared"]
+    receptor = prep["receptor_pdb"] if ligand else (
+        prep["complex_pdb"] if partner else prep["protein_pdb"])
+    counterion = manifest.get("suggested_counterion") or "cation"
+    if cfg["solvent"] == "implicit":
+        counterion = "none"
+    common = ["bash", os.path.join(SCRIPTS, "build_system.sh"),
+              "--type", "protein-ligand" if ligand else "protein-apo",
+              "--receptor", receptor,
+              "--ff", cfg["ff"], "--solvent", cfg["solvent"],
+              "--cation", cfg["cation"], "--anion", cfg["anion"],
+              "--counterion", counterion,
+              "--radii", cfg["radii"], "--igb", str(cfg["igb"]),
+              "--outdir", outdir, "--top-name", top_name,
+              "--no-pdb4amber", "--extra-leap", prep["extra_leap"],
+              "--force"]
+    if cfg["solvent"] == "explicit":
+        common += ["--water", cfg["water"], "--box", cfg["box"],
+                   "--pad", str(cfg["pad"])]
+    if ligand:
+        ligdir = os.path.join(cdir, "ligands", manifest["ligand"].get("resname", "LIG"))
+        common += ["--ligand", os.path.join(ligdir, "lig.mol2"),
+                   "--frcmod", os.path.join(ligdir, "lig.frcmod"),
+                   "--lig-resname", manifest["ligand"].get("resname", "LIG"),
+                   "--ligand-pdb", prep["ligand_prepared"],
+                   "--gaff", "gaff2"]
+
+    def attempt(ci):
+        cmd = list(common)
+        idx = cmd.index("--counterion") + 1
+        cmd[idx] = ci
+        return run(cmd, env=amber_env(cfg))
+
+    proc = attempt(counterion)
+    if (proc.returncode != 0 and counterion != "none"
+            and "net charge after neutralization" in proc.stdout):
+        flipped = "anion" if counterion == "cation" else "cation"
+        warn(f"build net-charge check failed with {counterion}; retrying with {flipped}")
+        proc = attempt(flipped)
+        if proc.returncode == 0:
+            counterion = flipped
+    if proc.returncode != 0:
+        raise BuildError("tleap build failed:\n" + tail(proc.stdout, 40))
+    bman = os.path.join(outdir, "build_manifest.json")
+    if os.path.isfile(bman):
+        with open(bman, encoding="utf-8") as fh:
+            bdata = json.load(fh)
+        if bdata.get("status") != "ok":
+            raise BuildError(f"build QC failed; see {outdir}/build_qc.tsv")
+    top_path = os.path.join(outdir, f"{top_name}.prmtop")
+    inpcrd_path = os.path.join(outdir, f"{top_name}.inpcrd")
+    if not os.path.isfile(top_path) or not os.path.isfile(inpcrd_path):
+        raise BuildError(f"tleap did not produce {top_path}/{inpcrd_path}")
+    return {
+        "top_name": top_name,
+        "prmtop": top_path,
+        "inpcrd": inpcrd_path,
+        "outdir": outdir,
+        "manifest": bman,
+        "counterion": counterion,
+    }
+
+
+def derive_masks(manifest, cdir, cfg):
+    sysdir = os.path.join(cdir, "systems", os.path.basename(cdir))
+    top = os.path.join(sysdir, f"{'apo' if manifest['type'] == 'apo-protein' else 'complex'}.prmtop")
+    masks_json = os.path.join(sysdir, "masks.json")
+    masks_env = os.path.join(sysdir, "masks.env")
+    cmd = [sys.executable, "-I", os.path.join(SCRIPTS, "residue_masks.py"),
+           "--prmtop", top, "--json", masks_json, "--env", masks_env, "--force"]
+    if manifest["type"] == "protein-ligand":
+        cmd += ["--ligand-resname", manifest["ligand"].get("resname", "LIG")]
+    elif manifest["type"] in ("protein-peptide", "protein-antibody", "protein-protein"):
+        ranges = manifest.get("partner_ranges", "")
+        if not ranges:
+            raise BuildError("protein partner has no partner residue range")
+        cmd += ["--partner-residues", ranges, "--partner-kind", manifest["type"]]
+    proc = run(cmd)
+    if proc.returncode != 0:
+        raise BuildError("mask derivation failed:\n" + tail(proc.stdout))
+    return read_env(masks_env), masks_json, masks_env
+
+
+def verify_linkage(manifest, cdir, cfg):
+    sysdir = os.path.join(cdir, "systems", os.path.basename(cdir))
+    top = os.path.join(sysdir, f"{'apo' if manifest['type'] == 'apo-protein' else 'complex'}.prmtop")
+    out = os.path.join(sysdir, "build_linkage.json")
+    cmd = [cfg["py_qc"], "-I", os.path.join(SCRIPTS, "verify_linkage.py"),
+           "--prmtop", top,
+           "--residue-map", manifest["prepared"]["residue_map"],
+           "--out", out, "--force"]
+    if manifest["type"] == "protein-ligand":
+        cmd += ["--ligand", "--ligand-resname", manifest["ligand"].get("resname", "LIG")]
+    proc = run(cmd)
+    if proc.returncode != 0:
+        raise BuildError("prmtop residue linkage check failed:\n" + tail(proc.stdout))
+    return out
+
+
+def read_env(path):
+    values = {}
+    if not os.path.isfile(path):
+        return values
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip("'\"")
+    return values
+
+
+def write_compat(manifest, cdir, cfg, args):
+    if manifest["type"] not in ("protein-ligand", "apo-protein"):
+        return
+    cfg_dir = os.path.join(cdir, "config")
+    os.makedirs(cfg_dir, exist_ok=True)
+    ligand = manifest["type"] == "protein-ligand"
+    q = manifest["ligand"]["charge"] if ligand else ""
+    system_type = "protein-ligand" if ligand else "protein-apo"
+    vals = {
+        "PROJECT_NAME": os.path.basename(cdir),
+        "AMBER_SH": cfg["amber_sh"],
+        "PY_QC": cfg["py_qc"],
+        "PY_ANALYSIS": cfg["py_analysis"],
+        "SYSTEM_TYPE": system_type,
+        "RECEPTOR_PDB": "prepare/receptor_prepared.pdb" if ligand else "prepare/protein_prepared.pdb",
+        "LIGAND_RESNAME": "LIG" if ligand else "",
+        "LIGAND_CHARGE": str(q) if ligand else "",
+        "GAFF": "gaff2",
+        "RECEPTOR_FF": cfg["ff"],
+        "SOLVENT": cfg["solvent"],
+        "WATER": cfg["water"],
+        "BOX": cfg["box"],
+        "PAD": str(cfg["pad"]),
+        "CATION": cfg["cation"],
+        "ANION": cfg["anion"],
+        "COUNTERION": manifest.get("suggested_counterion", "cation"),
+        "SALT_PAIRS": "0",
+        "RADII": cfg["radii"],
+        "IGB": str(cfg["igb"]),
+        "STRIP_MASK": cfg["strip_mask"],
+        "HEAT_NS": str(cfg["heat_ns"]),
+        "RELEASE_STAGES": str(cfg["release_stages"]),
+        "RELEASE_NS": str(cfg["release_ns"]),
+        "PROD_CHUNKS": str(cfg["prod_chunks"]),
+        "PROD_CHUNK_NS": str(cfg["prod_ns"] / cfg["prod_chunks"]),
+        "DT": str(cfg["dt"]),
+        "TRAJ_INTERVAL_PS": str(cfg["traj_interval_ps"]),
+        "SEED_BASE": str(cfg["seed_base"]),
+        "PBS_QUEUE": cfg["pbs_queue"],
+        "PBS_NODES": str(cfg["pbs_nodes"]),
+        "PBS_PPN": str(cfg["ppn"]),
+        "PBS_GPUS": str(cfg["gpus"]),
+        "PBS_WALLTIME": cfg["equil_walltime"],
+        "MMPBSA_METHOD": cfg["mmpbsa_method"],
+        "MMPBSA_IGB": str(cfg["mmpbsa_igb"]),
+        "MMPBSA_SALTCON": str(cfg["mmpbsa_saltcon"]),
+        "MMPBSA_INTERVAL": str(cfg["mmpbsa_interval"]),
+        "MMPBSA_DECOMP": "auto",
+        "MMPBSA_RADII": cfg["radii"],
+        "ANCHOR_MASK": "",
+        "FIXED_MASK": "",
+        "CONTACT_CUTOFF": "4.0",
+        "HBOND_HA_CUTOFF": "2.5",
+        "HBOND_DA_CUTOFF": "3.5",
+        "HBOND_ANGLE": "120",
+        "CONTACT_STRIDE": "10",
+        "SASA_STRIDE": "10",
+        "ANALYSIS_WINDOW": "last50",
+        "RNA_RESRANGE": "",
+        "LOOP_RESIDUES": "",
+        "LIGAND_RING_ATOMS": "",
+        "STACK_TARGETS": "",
+        "PBS_LOG_DIR": os.path.abspath(os.path.join(cdir, "logs")),
+    }
+    lines = [
+        "#!/bin/bash",
+        "# generated by amber-auto; compatibility snapshot for amber-kit",
+        'PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"',
+    ]
+    for key, value in vals.items():
+        lines.append(f"{key}={shlex.quote(str(value))}")
+    with open(os.path.join(cfg_dir, "config.sh"), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    label = os.path.basename(cdir)
+    row = [label, "-", str(q) if ligand else "-", "LIG" if ligand else "-",
+           "-", str(cfg["replicas"]), str(cfg["seed_base"]), "0", "-", "-",
+           "amber-auto"]
+    header = ["label", "ligand_pdb", "charge", "resname", "models", "replicas",
+              "seed_base", "control", "experimental", "experimental_type", "notes"]
+    with open(os.path.join(cfg_dir, "systems.tsv"), "w", encoding="utf-8") as fh:
+        fh.write("\t".join(header) + "\n")
+        fh.write("\t".join(row) + "\n")
+
+
+def job_name(label, rep, tag):
+    base = re.sub(r"[^A-Za-z0-9]", "", label)[:6]
+    digest = hashlib.md5(label.encode("utf-8")).hexdigest()[:2]
+    return f"{base}{digest}_r{rep}{tag}"
+
+
+def render_pbs(template, out, values):
+    cmd = [sys.executable, "-I", os.path.join(SCRIPTS, "render_template.py"),
+           template, "--out", out, "--force", "--allow-unused"]
+    for key, value in values.items():
+        cmd += ["--set", f"{key}={value}"]
+    proc = run(cmd)
+    if proc.returncode != 0:
+        raise BuildError(f"PBS render failed for {template}:\n" + tail(proc.stdout))
+
+
+def setup_replicas(manifest, masks, cdir, cfg, args):
+    label = os.path.basename(cdir)
+    top_name = "apo" if manifest["type"] == "apo-protein" else "complex"
+    sysdir = os.path.join(cdir, "systems", label)
+    top = os.path.join(sysdir, f"{top_name}.prmtop")
+    inpcrd = os.path.join(sysdir, f"{top_name}.inpcrd")
+    ligand = manifest["type"] == "protein-ligand"
+    partner = manifest["type"] in ("protein-peptide", "protein-antibody", "protein-protein")
+    apo = manifest["type"] == "apo-protein"
+    if not os.path.isfile(top) or not os.path.isfile(inpcrd):
+        raise BuildError(f"missing topology: {top}")
+    replicas = []
+    chunk_ns = float(cfg["prod_ns"]) / int(cfg["prod_chunks"])
+    steps = chunk_ns * 1000.0 / float(cfg["dt"])
+    if abs(steps - round(steps)) > 1e-6:
+        raise BuildError(
+            f"--prod-ns {cfg['prod_ns']} / --prod-chunks {cfg['prod_chunks']} "
+            f"gives {steps:.3f} steps per chunk, not an integer. Choose values "
+            "where prod_ns*1000/dt is divisible by prod_chunks.")
+    for rep in range(1, int(cfg["replicas"]) + 1):
+        seed = int(cfg["seed_base"]) + rep - 1
+        repdir = os.path.join(cdir, "md", label, f"r{rep}")
+        os.makedirs(repdir, exist_ok=True)
+        for src, name in ((top, f"{top_name}.prmtop"), (inpcrd, f"{top_name}.inpcrd")):
+            dst = os.path.join(repdir, name)
+            if os.path.lexists(dst):
+                os.remove(dst)
+            os.symlink(os.path.relpath(src, repdir), dst)
+        cmd = [cfg["py_qc"], "-I", os.path.join(SCRIPTS, "setup_md_inputs.py"),
+               "--out", repdir, "--seed", str(seed),
+               "--receptor-type", "protein", "--solvent", cfg["solvent"],
+               "--restraint-mask", masks["RESTRAINT_MASK"],
+               "--prmtop", top,
+               "--heat-ns", str(cfg["heat_ns"]),
+               "--release-stages", str(cfg["release_stages"]),
+               "--release-ns", str(cfg["release_ns"]),
+               "--prod-chunks", str(cfg["prod_chunks"]),
+               "--prod-chunk-ns", str(chunk_ns),
+               "--dt", str(cfg["dt"]),
+               "--traj-interval-ps", str(cfg["traj_interval_ps"]),
+               "--force"]
+        if ligand:
+            cmd += ["--ligand-resname", manifest["ligand"].get("resname", "LIG")]
+        if cfg["solvent"] == "implicit":
+            cmd += ["--igb", str(cfg["igb"]),
+                    "--saltcon", str(cfg["mmpbsa_saltcon"])]
+        proc = run(cmd)
+        if proc.returncode != 0:
+            raise BuildError(f"MD input generation failed for r{rep}:\n" + tail(proc.stdout))
+        with open(os.path.join(repdir, "run_config.json"), encoding="utf-8") as fh:
+            rc = json.load(fh)
+        release = [f[:-3] for f in rc["release"]["files"]]
+        prod = [f[:-3] for f in rc["production"]["files"]]
+        prefix = f"{label}_r{rep}"
+        logdir = os.path.join(cdir, "logs") + os.sep
+        analysis_root = os.path.join(cdir, "analysis")
+        os.makedirs(analysis_root, exist_ok=True)
+        common = {
+            "QUEUE": cfg["pbs_queue"], "NODES": str(cfg["pbs_nodes"]),
+            "PPN": str(cfg["ppn"]),
+            "JOIN": cfg["pbs_join"], "MAIL": cfg["pbs_mail"],
+            "LOG_DIR": logdir, "AMBER_SH": cfg["amber_sh"],
+        }
+        render_pbs(os.path.join(PBS_DIR, "run_equil.pbs.in"),
+                   os.path.join(repdir, "run_equil.pbs"),
+                   dict(common, **{
+                       "JOB_NAME": job_name(label, rep, "e"),
+                       "GPUS": str(cfg["gpus"]),
+                       "WALLTIME": cfg["equil_walltime"],
+                       "MPIRUN": "mpirun",
+                       "TOP": f"{top_name}.prmtop",
+                       "CRD": f"{top_name}.inpcrd",
+                       "MIN1": "01_min_restraint", "MIN2": "02_min_free",
+                       "HEAT": "03_heat",
+                       "RELEASE_STEMS": " ".join(release),
+                       "LAST_RELEASE": release[-1] if release else "03_heat",
+                   }))
+        render_pbs(os.path.join(PBS_DIR, "run_prod.pbs.in"),
+                   os.path.join(repdir, "run_prod.pbs"),
+                   dict(common, **{
+                       "JOB_NAME": job_name(label, rep, "p"),
+                       "GPUS": str(cfg["gpus"]),
+                       "WALLTIME": cfg["prod_walltime"],
+                       "TOP": f"{top_name}.prmtop",
+                       "PROD_STEMS": " ".join(prod),
+                       "LAST_PROD": prod[-1],
+                   }))
+        do_mmpbsa = bool(cfg["mmpbsa"]) and (ligand or partner)
+        render_pbs(os.path.join(PBS_DIR, "run_post.pbs.in"),
+                   os.path.join(repdir, "run_post.pbs"),
+                   dict(common, **{
+                       "JOB_NAME": job_name(label, rep, "o"),
+                       "WALLTIME": cfg["post_walltime"],
+                       "KIT_DIR": KIT_DIR,
+                       "TOP": f"{top_name}.prmtop",
+                       "PREFIX": prefix, "REP": str(rep),
+                       "ANALYSIS_ROOT": analysis_root,
+                       "STRIP_MASK": cfg["strip_mask"],
+                       "LIGAND_RESNAME": "LIG" if ligand else "",
+                       "PARTNER_RESIDUES": manifest.get("partner_ranges", "") if partner else "",
+                       "PARTNER_KIND": manifest["type"] if partner else "protein",
+                       "RECEPTOR_MASK": masks.get("RECEPTOR_MASK", ""),
+                       "MMPBSA": "1" if do_mmpbsa else "0",
+                       "MMPBSA_MASK": masks.get("LIGAND_MASK", ""),
+                       "MMPBSA_METHOD": cfg["mmpbsa_method"],
+                       "IGB": str(cfg["mmpbsa_igb"]),
+                       "SALTCON": str(cfg["mmpbsa_saltcon"]),
+                       "MMPBSA_INTERVAL": str(cfg["mmpbsa_interval"]),
+                       "DECOMP_RESIDUES": "",
+                       "RADII": cfg["radii"],
+                       "DRY_TOP": "1" if cfg["solvent"] == "implicit" else "0",
+                       "PY_ANALYSIS": cfg["py_analysis"],
+                       "HBOND_STRIDE": "2" if ligand else "10",
+                       "NO_HBOND": "0" if (ligand or partner) else "1",
+                       "FRAME_PS": str(cfg["traj_interval_ps"]),
+                   }))
+        replicas.append({
+            "rep": rep,
+            "dir": os.path.relpath(repdir, cdir),
+            "seed": seed,
+            "prefix": prefix,
+            "scripts": {
+                "equil": os.path.join(repdir, "run_equil.pbs"),
+                "prod": os.path.join(repdir, "run_prod.pbs"),
+                "post": os.path.join(repdir, "run_post.pbs"),
+            },
+            "jobs": [],
+        })
+    return replicas
+
+
+def build_one(pdb, args, cfg, root, state):
+    sha = sha256(pdb)
+    label = unique_label(root, state, pdb, getattr(args, "name", None),
+                         force=getattr(args, "force", False))
+    for existing in state.get("complexes", []):
+        if existing.get("input_sha256") == sha and existing["label"] != label:
+            raise BuildError(f"duplicate input content: {pdb} is identical to "
+                             f"{existing['input']} ({existing['label']})")
+    cdir = os.path.join(root, "complexes", label)
+    if getattr(args, "force", False):
+        for sub in ("prepare", os.path.join("systems", label),
+                    os.path.join("ligands", args.ligand_resname),
+                    os.path.join("md", label),
+                    "analysis/cpptraj", "analysis/python",
+                    "analysis/mmpbsa", "analysis/tables",
+                    "analysis"):
+            shutil.rmtree(os.path.join(cdir, sub), ignore_errors=True)
+    for sub in ("inputs", "prepare", "ligands", "systems", "md",
+                "analysis/cpptraj", "analysis/python", "analysis/mmpbsa",
+                "analysis/tables", "logs", "config"):
+        os.makedirs(os.path.join(cdir, sub), exist_ok=True)
+    input_copy = os.path.join(cdir, "inputs", "original.pdb")
+    if os.path.abspath(pdb) != os.path.abspath(input_copy):
+        shutil.copy2(pdb, input_copy)
+    entry = {
+        "label": label,
+        "input": os.path.abspath(pdb),
+        "input_sha256": sha,
+        "type": None,
+        "classification_confidence": None,
+        "status": "building",
+        "components_json": os.path.join(cdir, "components.json"),
+        "prepare_manifest": os.path.join(cdir, "prepare", "prepare_manifest.json"),
+        "warnings": [],
+        "errors": [],
+        "replicas": [],
+        "jobs": [],
+    }
+    # Replace or append the state entry early so a failed build is visible.
+    state["complexes"] = [e for e in state["complexes"] if e["label"] != label]
+    state["complexes"].append(entry)
+    save_state(root, state)
+
+    try:
+        comp = inspect_one(input_copy, entry["components_json"], args, cfg)
+        cls = comp["classification"]
+        entry["type"] = cls["type"]
+        entry["classification_confidence"] = cls["confidence"]
+        entry["warnings"].extend(cls.get("warnings", []))
+        entry["roles"] = {
+            "receptor_chains": cls["receptor"]["chains"],
+            "partner_chains": cls["partner"]["chains"],
+            "ligand": cls.get("ligand"),
+        }
+        manifest = prepare_one(input_copy, entry["components_json"],
+                               os.path.join(cdir, "prepare"), args, cfg)
+        entry["roles"]["ligand"] = manifest.get("ligand")
+        entry["roles"]["partner_residues"] = manifest.get("partner_residues", [])
+        entry["warnings"].extend(manifest.get("warnings", []))
+        if manifest["type"] == "protein-ligand":
+            param_ligand(manifest, cdir, cfg, force=True)
+        build = build_system(manifest, cdir, cfg, args)
+        masks, masks_json, masks_env = derive_masks(manifest, cdir, cfg)
+        linkage = verify_linkage(manifest, cdir, cfg)
+        write_compat(manifest, cdir, cfg, args)
+        replicas = setup_replicas(manifest, masks, cdir, cfg, args)
+        entry.update({
+            "status": "built",
+            "build": {
+                "top_name": build["top_name"],
+                "prmtop": rel(build["prmtop"], cdir),
+                "inpcrd": rel(build["inpcrd"], cdir),
+                "manifest": rel(build["manifest"], cdir),
+                "linkage": rel(linkage, cdir),
+                "counterion": build["counterion"],
+            },
+            "masks": {
+                "restraint": masks.get("RESTRAINT_MASK", ""),
+                "receptor": masks.get("RECEPTOR_MASK", ""),
+                "partner": masks.get("PARTNER_MASK", ""),
+                "ligand": masks.get("LIGAND_MASK", ""),
+                "partner_residues": manifest.get("partner_residues", []),
+            },
+            "replicas": replicas,
+        })
+        save_state(root, state)
+        return entry
+    except BuildError as exc:
+        entry["status"] = "failed"
+        entry["errors"].append(str(exc))
+        save_state(root, state)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# submission / status / report / resume
+# ---------------------------------------------------------------------------
+def qsub_cmd():
+    return shlex.split(os.environ.get("AMBER_AUTO_QSUB", "qsub"))
+
+
+def parse_jobid(text):
+    for line in reversed((text or "").splitlines()):
+        m = re.match(r"^\s*([0-9]+(?:\.[A-Za-z0-9._-]+)?)\s*$", line)
+        if m:
+            return m.group(1)
+    raise SubmissionError("qsub did not return a job id:\n" + tail(text))
+
+
+def submit_chain(entry, cdir, rep, cfg, from_stage="equil", dry=False):
+    stages = ["equil", "prod", "post"]
+    start = stages.index(from_stage)
+    repdir = os.path.join(cdir, rep["dir"])
+    jobs = {j["kind"]: j for j in rep.get("jobs", [])}
+    previous = None
+    plan = []
+    for stage in stages[start:]:
+        script = rep["scripts"][stage]
+        cmd = list(qsub_cmd())
+        if previous:
+            cmd += ["-W", f"depend=afterok:{previous}"]
+        cmd.append(os.path.basename(script))
+        rendered = " ".join(shlex.quote(x) for x in cmd)
+        if dry:
+            print(f"DRY-RUN: (cd {repdir} && {rendered})")
+            jobid = f"DRYRUN-{entry['label']}-r{rep['rep']}-{stage}"
+        else:
+            proc = run(cmd, cwd=repdir)
+            if proc.returncode != 0:
+                raise SubmissionError(
+                    f"qsub failed for {stage} ({repdir}):\n" + tail(proc.stdout))
+            jobid = parse_jobid(proc.stdout)
+        job = {
+            "kind": stage,
+            "jobid": jobid,
+            "script": rel(script, cdir),
+            "depends_on": previous,
+            "state": "DRY" if dry else "Q",
+            "submitted_at": now(),
+        }
+        jobs[stage] = job
+        # Track each submitted job immediately: if a later qsub fails, the
+        # already-running jobs must still appear in campaign.json.
+        rep["jobs"] = [jobs[k] for k in stages if k in jobs]
+        plan.append({"rep": rep["rep"], "kind": stage, "cwd": repdir,
+                     "command": rendered, "jobid": jobid,
+                     "depends_on": previous})
+        previous = jobid
+    return plan
+
+
+def submit_entry(entry, cdir, cfg, dry=False):
+    plans = []
+    from_stage = "equil"
+    for rep in entry.get("replicas", []):
+        plans.extend(submit_chain(entry, cdir, rep, cfg,
+                                  from_stage=from_stage, dry=dry))
+    entry["status"] = "submitted" if not dry else "dry-run"
+    return plans
+
+
+def qstat_job(jobid):
+    if not jobid or jobid.startswith("DRYRUN"):
+        return None
+    cmd = shlex.split(os.environ.get("AMBER_AUTO_QSTAT", "qstat")) + ["-f", jobid]
+    proc = run(cmd)
+    if proc.returncode != 0:
+        return None
+    fields = {}
+    for line in proc.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            fields[key.strip()] = value.strip()
+    return {
+        "state": fields.get("job_state", ""),
+        "exit_status": fields.get("exit_status", ""),
+        "depend": fields.get("depend", ""),
+    }
+
+
+def status_sh(cdir):
+    cmd = ["bash", os.path.join(SCRIPTS, "status.sh"), cdir,
+           "--md-glob", "md/*/r*", "--json"]
+    proc = run(cmd)
+    if proc.returncode != 0:
+        return {}
+    try:
+        return json.loads(proc.stdout)
+    except Exception:
+        return {}
+
+
+def read_mmpbsa(cdir, prefix):
+    path = os.path.join(cdir, "analysis", "mmpbsa", prefix, "summary.tsv")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh, delimiter="\t"))
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def read_json(path):
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def post_ok(cdir, prefix):
+    """True when post-processing finished its required steps successfully."""
+    data = read_json(os.path.join(cdir, "analysis",
+                                  f"post_status_{prefix}.json"))
+    if not data:
+        return False
+    steps = data.get("steps", {})
+    if steps.get("cpptraj") != 0 or steps.get("analyze") != 0:
+        return False
+    # 0 = success, 2 = skipped (e.g. --no-mmpbsa); hbond is non-fatal
+    if steps.get("mmpbsa", 0) not in (0, 2):
+        return False
+    return True
+
+
+def job_display(job):
+    if not job:
+        return "-"
+    jid = job.get("jobid", "")
+    if jid.startswith("DRYRUN"):
+        return "DRY"
+    info = qstat_job(jid)
+    if info:
+        state = info.get("state") or "?"
+        if state == "C":
+            try:
+                return "C0" if int(info.get("exit_status", "0")) == 0 else "CF"
+            except ValueError:
+                return "C?"
+        return state
+    return "-"
+
+
+def collect_status(root, cfg):
+    state = load_state(root)
+    rows = []
+    for entry in state.get("complexes", []):
+        cdir = os.path.join(root, "complexes", entry["label"])
+        st = status_sh(cdir)
+        by_rep = {}
+        for row in st.get("replicas", []):
+            by_rep[row.get("replica")] = row
+        if not entry.get("replicas"):
+            rows.append({
+                "complex": entry["label"], "type": entry.get("type") or "?",
+                "rep": "-", "stage": "-", "nstep": "-", "ns_day": "-",
+                "status": entry.get("status", "?"), "equil": "-", "prod": "-",
+                "post": "-", "dg": "-", "warnings": len(entry.get("warnings", [])),
+            })
+            continue
+        for rep in entry["replicas"]:
+            key = f"{entry['label']}/r{rep['rep']}"
+            sr = by_rep.get(key, {})
+            jobs = {j["kind"]: j for j in rep.get("jobs", [])}
+            displays = {k: job_display(jobs.get(k))
+                        for k in ("equil", "prod", "post")}
+            repdir = os.path.join(cdir, rep["dir"])
+            files_done = (
+                os.path.isfile(os.path.join(repdir, "npt.rst7"))
+                and os.path.isfile(os.path.join(repdir, "prod_final.rst7"))
+                and post_ok(cdir, rep["prefix"]))
+            submitted = [d for d in displays.values() if d not in ("-", "DRY")]
+            dg = read_mmpbsa(cdir, rep["prefix"])
+            dg_txt = "-"
+            if dg and dg.get("dg_kcal_mol"):
+                dg_txt = f"{float(dg['dg_kcal_mol']):.1f}"
+            status = entry.get("status", "?")
+            if status == "failed":
+                status = "FAILED"
+            elif any(d == "CF" for d in displays.values()):
+                status = "failed"
+            elif files_done or (len(submitted) == 3
+                                and all(d == "C0" for d in submitted)):
+                status = "done"
+            rows.append({
+                "complex": entry["label"],
+                "type": entry.get("type") or "?",
+                "rep": rep["rep"],
+                "stage": sr.get("stage", "-"),
+                "nstep": sr.get("nstep", "-"),
+                "ns_day": sr.get("ns_day", "-"),
+                "status": status,
+                "equil": displays["equil"],
+                "prod": displays["prod"],
+                "post": displays["post"],
+                "dg": dg_txt,
+                "warnings": len(entry.get("warnings", [])),
+            })
+    return state, rows
+
+
+def print_status(rows, queue=False):
+    header = ("COMPLEX", "TYPE", "R", "STAGE", "NSTEP", "NS/DAY", "STATUS",
+              "EQUIL", "PROD", "POST", "DG")
+    keys = ("complex", "type", "rep", "stage", "nstep", "ns_day", "status",
+            "equil", "prod", "post", "dg")
+    widths = [len(h) for h in header]
+    for row in rows:
+        for i, key in enumerate(keys):
+            widths[i] = max(widths[i], len(str(row.get(key, "-"))))
+    fmt = "  ".join("{:<%d}" % w for w in widths)
+    print(fmt.format(*header))
+    for row in rows:
+        print(fmt.format(*(str(row.get(k, "-")) for k in keys)))
+    if queue:
+        proc = run(shlex.split(os.environ.get("AMBER_AUTO_QSTAT", "qstat")) + ["-a"])
+        if proc.returncode == 0:
+            print("\n--- qstat -a ---")
+            print(proc.stdout.rstrip())
+
+
+def write_report(root, state, status_map=None):
+    repdir = os.path.join(root, "report")
+    os.makedirs(repdir, exist_ok=True)
+    rows = []
+    details = []
+    for entry in state.get("complexes", []):
+        cdir = os.path.join(root, "complexes", entry["label"])
+        bman = read_json(os.path.join(cdir, entry.get("build", {}).get("manifest", "")))
+        qc = "?"
+        if bman:
+            qc = bman.get("status", "?")
+        ligand = entry.get("roles", {}).get("ligand") or {}
+        partner = entry.get("roles", {}).get("partner_residues") or []
+        dgs = []
+        sds = []
+        frames = []
+        metrics = {}
+        for rep in entry.get("replicas", []):
+            mm = read_mmpbsa(cdir, rep["prefix"])
+            if mm and mm.get("dg_kcal_mol"):
+                try:
+                    dgs.append(float(mm["dg_kcal_mol"]))
+                    if mm.get("sd_kcal_mol") not in (None, "", "NA"):
+                        sds.append(float(mm["sd_kcal_mol"]))
+                    frames.append(int(float(mm.get("frames", 0))))
+                except ValueError:
+                    pass
+            py = read_json(os.path.join(cdir, "analysis", "python",
+                                        rep["prefix"] + ".json"))
+            if py:
+                metrics = py.get("metrics", {})
+        dg_mean = sum(dgs) / len(dgs) if dgs else None
+        dg_sd = None
+        if len(dgs) > 1:
+            mean = dg_mean
+            dg_sd = (sum((x - mean) ** 2 for x in dgs) / (len(dgs) - 1)) ** 0.5
+        elif sds:
+            dg_sd = sds[0]
+        rep_status = (status_map or {}).get((entry["label"], 1), {})
+        rep_statuses = []
+        for rep in entry.get("replicas", []):
+            s = (status_map or {}).get((entry["label"], rep["rep"]), {}).get("status")
+            if s:
+                rep_statuses.append(s)
+        status_value = rep_status.get("status", entry.get("status", "?"))
+        if rep_statuses:
+            if any(s == "failed" for s in rep_statuses):
+                status_value = "failed"
+            elif all(s == "done" for s in rep_statuses):
+                status_value = "done"
+            elif status_value == "done":
+                status_value = next((s for s in rep_statuses if s != "done"),
+                                    status_value)
+        row = {
+            "complex": entry["label"],
+            "type": entry.get("type", "?"),
+            "replicas": len(entry.get("replicas", [])),
+            "status": status_value,
+            "qc": qc,
+            "stage": rep_status.get("stage", "-"),
+            "nstep": rep_status.get("nstep", "-"),
+            "ns_day": rep_status.get("ns_day", "-"),
+            "ligand": ligand.get("resname", ""),
+            "charge": ligand.get("charge", ""),
+            "charge_method": ligand.get("method", ""),
+            "partner_residues": ",".join(str(x) for x in partner),
+            "dg": f"{dg_mean:.2f}" if dg_mean is not None else "",
+            "dg_sd": f"{dg_sd:.2f}" if dg_sd is not None else "",
+            "frames": frames[0] if frames else "",
+            "warnings": " | ".join(entry.get("warnings", [])),
+        }
+        rows.append(row)
+        details.append((entry, row, metrics, dgs))
+    header = ["complex", "type", "replicas", "status", "qc", "stage", "nstep",
+              "ns_day", "ligand", "charge", "charge_method", "partner_residues",
+              "dg", "dg_sd", "frames", "warnings"]
+    with open(os.path.join(repdir, "summary.tsv"), "w", encoding="utf-8") as fh:
+        fh.write("\t".join(header) + "\n")
+        for row in rows:
+            fh.write("\t".join(str(row[k]) for k in header) + "\n")
+    with open(os.path.join(repdir, "report.json"), "w", encoding="utf-8") as fh:
+        json.dump({"generated_at": now(), "campaign": root, "systems": rows},
+                  fh, indent=2)
+        fh.write("\n")
+    lines = ["# amber-auto report", "", f"Campaign: `{root}`", ""]
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("|" + "|".join(["---"] * len(header)) + "|")
+    for row in rows:
+        lines.append("| " + " | ".join(str(row[k]) for k in header) + " |")
+    lines.append("")
+    for entry, row, metrics, dgs in details:
+        lines.append(f"## {entry['label']}")
+        lines.append("")
+        lines.append(f"- type: `{row['type']}`; status: `{row['status']}`; "
+                     f"QC: `{row['qc']}`")
+        if row["ligand"]:
+            lines.append(f"- ligand: `{row['ligand']}` charge "
+                         f"`{row['charge']}` ({row['charge_method']})")
+        if row["partner_residues"]:
+            lines.append(f"- partner residues: `{row['partner_residues']}`")
+        if metrics:
+            rr = metrics.get("receptor_rmsd", {}).get("mean")
+            lr = metrics.get("ligand_rmsd", {}).get("mean")
+            md = metrics.get("min_dist", {}).get("median")
+            lines.append(f"- receptor RMSD mean: {rr}; ligand RMSD mean: {lr}; "
+                         f"min contact distance median: {md}")
+        if dgs:
+            lines.append("- MM/GBSA ΔG per replica: "
+                         + ", ".join(f"{x:.2f}" for x in dgs) + " kcal/mol")
+        if entry.get("warnings"):
+            lines.append("- warnings: " + "; ".join(entry["warnings"]))
+        lines.append("")
+    with open(os.path.join(repdir, "report.md"), "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return rows
+
+
+def cmd_inspect(args, cfg):
+    if getattr(args, "name", None) and len(args.pdbs) > 1:
+        die("--name is only valid with one input PDB")
+    root = campaign_root(cfg)
+    outdir = os.path.join(root, "inspections")
+    os.makedirs(outdir, exist_ok=True)
+    results = []
+    failed = False
+    used = set()
+    for pdb in args.pdbs:
+        base = label_for(pdb, getattr(args, "name", None))
+        label = base
+        n = 2
+        while label in used:
+            label = f"{base[:36]}_{n}"
+            n += 1
+        used.add(label)
+        out = os.path.join(outdir, label + ".json")
+        try:
+            data = inspect_one(os.path.abspath(pdb), out, args, cfg)
+            results.append({"label": label, "type": data["classification"]["type"],
+                            "confidence": data["classification"]["confidence"],
+                            "errors": [], "json": out})
+            print(f"{label}: {data['classification']['type']} "
+                  f"({data['classification']['confidence']}) -> {out}")
+        except BuildError as exc:
+            failed = True
+            print(f"{label}: ERROR\n{exc}", file=sys.stderr)
+            results.append({"label": label, "error": str(exc), "json": out})
+    if args.json:
+        print(json.dumps(results, indent=2))
+    if failed:
+        sys.exit(2)
+
+
+def cmd_build_or_run(args, cfg, submit):
+    if getattr(args, "name", None) and len(args.pdbs) > 1:
+        die("--name is only valid with one input PDB")
+    validate_config(cfg)
+    root = campaign_root(cfg)
+    state = load_state(root)
+    state["config"] = {k: v for k, v in cfg.items() if k != "campaign"}
+    entries = []
+    failures = 0
+    for pdb in args.pdbs:
+        try:
+            entry = build_one(os.path.abspath(pdb), args, cfg, root, state)
+            entries.append(entry)
+            print(f"{entry['label']}: built ({entry['type']})")
+        except BuildError as exc:
+            failures += 1
+            print(f"error: {os.path.basename(pdb)}: {exc}", file=sys.stderr)
+    if submit and not args.no_submit:
+        if failures and not args.submit_partial:
+            print("not submitting any job because at least one complex failed; "
+                  "use --submit-partial to submit the successful ones",
+                  file=sys.stderr)
+        else:
+            plan = []
+            for entry in entries:
+                if entry.get("status") != "built":
+                    continue
+                cdir = os.path.join(root, "complexes", entry["label"])
+                try:
+                    plan.extend(submit_entry(entry, cdir, cfg, dry=args.dry_run))
+                    entry["status"] = "dry-run" if args.dry_run else "submitted"
+                except SubmissionError as exc:
+                    entry["status"] = "submit-failed"
+                    entry["errors"].append(str(exc))
+                    failures += 1
+                    print(f"error: {entry['label']}: {exc}", file=sys.stderr)
+            save_state(root, state)
+            if args.dry_run:
+                with open(os.path.join(root, "submission_plan.json"), "w",
+                          encoding="utf-8") as fh:
+                    json.dump(plan, fh, indent=2)
+                    fh.write("\n")
+    save_state(root, state)
+    if getattr(args, "json", False):
+        requested = {os.path.abspath(p) for p in args.pdbs}
+        result = [e for e in state.get("complexes", [])
+                  if e.get("input") in requested]
+        print(json.dumps([
+            {"label": e.get("label"), "type": e.get("type"),
+             "status": e.get("status"), "errors": e.get("errors", []),
+             "dir": os.path.join(root, "complexes", e.get("label", ""))}
+            for e in result], indent=2))
+    if failures:
+        sys.exit(5 if len(entries) > failures else 3)
+
+
+def cmd_status(args, cfg):
+    root = os.path.abspath(cfg["campaign"])
+    if not os.path.isfile(state_path(root)):
+        die(f"no campaign.json in {root}; run amber-auto run/build first")
+    state, rows = collect_status(root, cfg)
+    if args.json:
+        print(json.dumps({"campaign": root, "systems": rows}, indent=2))
+    else:
+        print_status(rows, queue=args.queue)
+    if args.queue and not args.json:
+        pass
+
+
+def cmd_report(args, cfg):
+    root = os.path.abspath(cfg["campaign"])
+    if not os.path.isfile(state_path(root)):
+        die(f"no campaign.json in {root}")
+    state = load_state(root)
+    _, srows = collect_status(root, cfg)
+    status_map = {(r["complex"], r["rep"]): r for r in srows}
+    rows = write_report(root, state, status_map)
+    print(f"wrote {os.path.join(root, 'report', 'summary.tsv')}")
+    print(f"wrote {os.path.join(root, 'report', 'report.md')}")
+    if args.json:
+        print(json.dumps(rows, indent=2))
+
+
+def cmd_resume(args, cfg):
+    root = os.path.abspath(cfg["campaign"])
+    if not os.path.isfile(state_path(root)):
+        die(f"no campaign.json in {root}")
+    state = load_state(root)
+    plans = []
+    failures = 0
+    for entry in state.get("complexes", []):
+        if args.complex and entry["label"] != args.complex:
+            continue
+        if entry.get("status") == "failed":
+            print(f"{entry['label']}: skipped (build failed)", file=sys.stderr)
+            continue
+        cdir = os.path.join(root, "complexes", entry["label"])
+        for rep in entry.get("replicas", []):
+            if args.rep and str(rep["rep"]) != str(args.rep):
+                continue
+            repdir = os.path.join(cdir, rep["dir"])
+            if not os.path.isfile(os.path.join(repdir, "run_equil.pbs")):
+                warn(f"{entry['label']} r{rep['rep']}: missing run_equil.pbs; run build first")
+                continue
+            active = False
+            for job in rep.get("jobs", []):
+                info = qstat_job(job.get("jobid", ""))
+                if info and info.get("state") in ("Q", "R", "H", "W", "S"):
+                    active = True
+                    break
+            if active and not args.force:
+                print(f"{entry['label']} r{rep['rep']}: job still active; skip")
+                continue
+            npt = os.path.isfile(os.path.join(repdir, "npt.rst7"))
+            prod = os.path.isfile(os.path.join(repdir, "prod_final.rst7"))
+            post = post_ok(cdir, rep["prefix"])
+            if args.force:
+                from_stage = "equil"
+            elif not npt:
+                from_stage = "equil"
+            elif not prod:
+                from_stage = "prod"
+            elif not post:
+                from_stage = "post"
+            else:
+                print(f"{entry['label']} r{rep['rep']}: complete")
+                continue
+            print(f"{entry['label']} r{rep['rep']}: resubmit from {from_stage}")
+            try:
+                plans.extend(submit_chain(entry, cdir, rep, cfg,
+                                          from_stage=from_stage,
+                                          dry=args.dry_run))
+                entry["status"] = "submitted"
+            except SubmissionError as exc:
+                failures += 1
+                entry["status"] = "submit-failed"
+                print(f"error: {entry['label']} r{rep['rep']}: {exc}",
+                      file=sys.stderr)
+    save_state(root, state)
+    if failures:
+        sys.exit(4)
+    if args.dry_run:
+        with open(os.path.join(root, "resume_plan.json"), "w", encoding="utf-8") as fh:
+            json.dump(plans, fh, indent=2)
+            fh.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def add_common(p):
+    p.add_argument("--campaign", default=None,
+                   help="campaign root (default ./amber-campaign)")
+    p.add_argument("--config", default=None,
+                   help="JSON config (default: $AMBER_AUTO_CONFIG, "
+                        "else config/auto.example.json)")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--amber-sh", default=None)
+    p.add_argument("--rdkit-python", default=None)
+    p.add_argument("--py-qc", default=None)
+    p.add_argument("--py-analysis", default=None)
+    p.add_argument("--obabel", default=None)
+
+
+def add_build_options(p):
+    p.add_argument("pdbs", nargs="+", help="one or more complex PDB files")
+    p.add_argument("--name", default=None, help="label (single input only)")
+    p.add_argument("--type", default="auto",
+                   choices=["auto", "protein-ligand", "protein-peptide",
+                            "protein-antibody", "protein-protein", "apo-protein"])
+    p.add_argument("--ligand", default=None, help="RESNAME[:CHAIN[:RESID]]")
+    p.add_argument("--ligand-resname", default="LIG")
+    p.add_argument("--charge", type=int, default=None)
+    p.add_argument("--ligand-smiles", default=None)
+    p.add_argument("--ph", default=None)
+    p.add_argument("--receptor-chains", default=None)
+    p.add_argument("--partner-chains", default=None)
+    p.add_argument("--model", type=int, default=1)
+    p.add_argument("--altloc", default="most-populous")
+    p.add_argument("--ss-cutoff", type=float, default=2.5)
+    p.add_argument("--cn-break-cutoff", type=float, default=2.0)
+    p.add_argument("--drop-glycans", action="store_true")
+    p.add_argument("--drop-metals", action="store_true")
+    p.add_argument("--drop-modified", action="store_true")
+    p.add_argument("--drop-unknown-hetatm", action="store_true")
+    p.add_argument("--drop-other-ligands", action="store_true")
+    p.add_argument("--strict-gaps", action="store_true")
+    p.add_argument("--no-reduce", action="store_true")
+    p.add_argument("--solvent", default=None, choices=["explicit", "implicit"])
+    p.add_argument("--ff", default=None, choices=["ff19SB", "ff14SB"])
+    p.add_argument("--water", default=None, choices=["opc", "tip3p"])
+    p.add_argument("--box", default=None, choices=["oct", "rect"])
+    p.add_argument("--pad", type=float, default=None)
+    p.add_argument("--cation", default=None)
+    p.add_argument("--anion", default=None)
+    p.add_argument("--radii", default=None, choices=["mbondi", "mbondi2", "mbondi3"])
+    p.add_argument("--igb", type=int, default=None)
+    p.add_argument("--replicas", type=int, default=None)
+    p.add_argument("--seed-base", type=int, default=None)
+    p.add_argument("--heat-ns", type=float, default=None)
+    p.add_argument("--release-stages", type=int, default=None)
+    p.add_argument("--release-ns", type=float, default=None)
+    p.add_argument("--prod-ns", type=float, default=None)
+    p.add_argument("--prod-chunks", type=int, default=None)
+    p.add_argument("--dt", type=float, default=None)
+    p.add_argument("--traj-interval-ps", type=float, default=None)
+    p.add_argument("--pbs-queue", default=None)
+    p.add_argument("--pbs-nodes", default=None,
+                   help="Torque nodes spec (default 1); use a node name "
+                        "(e.g. node02) to pin a job or avoid a bad node")
+    p.add_argument("--ppn", type=int, default=None)
+    p.add_argument("--gpus", type=int, default=None)
+    p.add_argument("--equil-walltime", default=None)
+    p.add_argument("--prod-walltime", default=None)
+    p.add_argument("--post-walltime", default=None)
+    p.add_argument("--no-mmpbsa", action="store_true")
+    p.add_argument("--mmpbsa-method", default=None, choices=["gb", "pb"])
+    p.add_argument("--mmpbsa-igb", type=int, default=None)
+    p.add_argument("--mmpbsa-saltcon", type=float, default=None)
+    p.add_argument("--mmpbsa-interval", type=int, default=None)
+    p.add_argument("--no-submit", action="store_true",
+                   help="build and render only; do not qsub")
+    p.add_argument("--submit-partial", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--force", action="store_true")
+
+
+def main():
+    global VERBOSE
+    ap = argparse.ArgumentParser(
+        description="One-command Amber MD for protein-ligand/peptide/antibody complexes",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    p_inspect = sub.add_parser("inspect", help="classify complexes without building")
+    add_common(p_inspect)
+    p_inspect.add_argument("pdbs", nargs="+")
+    p_inspect.add_argument("--name", default=None)
+    p_inspect.add_argument("--type", default="auto",
+                           choices=["auto", "protein-ligand", "protein-peptide",
+                                    "protein-antibody", "protein-protein", "apo-protein"])
+    p_inspect.add_argument("--ligand", default=None)
+    p_inspect.add_argument("--receptor-chains", default=None)
+    p_inspect.add_argument("--partner-chains", default=None)
+    p_inspect.add_argument("--model", type=int, default=1)
+    p_inspect.add_argument("--altloc", default="most-populous")
+    p_inspect.add_argument("--ss-cutoff", type=float, default=2.5)
+    p_inspect.add_argument("--cn-break-cutoff", type=float, default=2.0)
+    p_inspect.add_argument("--drop-glycans", action="store_true")
+    p_inspect.add_argument("--drop-metals", action="store_true")
+    p_inspect.add_argument("--drop-modified", action="store_true")
+    p_inspect.add_argument("--drop-unknown-hetatm", action="store_true")
+    p_inspect.add_argument("--drop-other-ligands", action="store_true")
+    p_inspect.add_argument("--strict-gaps", action="store_true")
+    p_inspect.add_argument("--json", action="store_true")
+    p_inspect.set_defaults(func=lambda a: cmd_inspect(a, load_config(a)))
+
+    for name, submit in (("build", False), ("run", True)):
+        p = sub.add_parser(name)
+        add_common(p)
+        add_build_options(p)
+        p.set_defaults(func=lambda a, s=submit: cmd_build_or_run(a, load_config(a), s))
+
+    p_status = sub.add_parser("status")
+    add_common(p_status)
+    p_status.add_argument("--queue", action="store_true")
+    p_status.add_argument("--json", action="store_true")
+    p_status.set_defaults(func=lambda a: cmd_status(a, load_config(a)))
+
+    p_report = sub.add_parser("report")
+    add_common(p_report)
+    p_report.add_argument("--json", action="store_true")
+    p_report.set_defaults(func=lambda a: cmd_report(a, load_config(a)))
+
+    p_resume = sub.add_parser("resume")
+    add_common(p_resume)
+    p_resume.add_argument("--complex", default=None)
+    p_resume.add_argument("--rep", default=None)
+    p_resume.add_argument("--dry-run", action="store_true")
+    p_resume.add_argument("--force", action="store_true")
+    p_resume.set_defaults(func=lambda a: cmd_resume(a, load_config(a)))
+
+    args = ap.parse_args()
+    VERBOSE = bool(getattr(args, "verbose", False))
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

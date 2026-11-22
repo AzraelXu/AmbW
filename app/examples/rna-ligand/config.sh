@@ -1,0 +1,49 @@
+#!/bin/bash
+# 示例：RNA–配体（RNA.YIL + TIP3P + K+）
+# 使用方法：复制到 <project>/config/config.sh，再按需修改。
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_NAME="rna_lig"
+
+AMBER_SH="/opt/software/amber22/amber.sh"
+PY_QC="/opt/software/amber_general_workflow/envs/qc/bin/python"
+PY_ANALYSIS="/opt/software/amber_general_workflow/envs/analysis/bin/python"
+MPIRUN="mpirun"
+
+SYSTEM_TYPE="rna-ligand"
+RECEPTOR_PDB="inputs/receptor.pdb"
+RECEPTOR_MODEL=""
+LIGAND_RESNAME="LIG"
+LIGAND_CHARGE=""          # 必须手填
+GAFF="gaff2"
+
+RECEPTOR_FF="RNA.YIL"
+SOLVENT="explicit"
+WATER="tip3p"
+BOX="oct"; PAD=10.0
+CATION="K+"; ANION="Cl-"; COUNTERION="cation"; SALT_PAIRS=0
+RADII="mbondi2"; IGB=5
+
+RESTRAINT_MASK="auto"; RECEPTOR_MASK="auto"; LIGAND_MASK="auto"
+STRIP_MASK=":WAT,K+,Cl-,Na+"
+ANCHOR_MASK=":1-13"
+FIXED_MASK=":14-26,27"
+
+HEAT_NS=2; RELEASE_STAGES=10; RELEASE_NS=1
+PROD_CHUNKS=4; PROD_CHUNK_NS=25; DT=0.002; TRAJ_INTERVAL_PS=10
+SEED_BASE=20261001
+
+PBS_QUEUE="batch"; PBS_NODES=1; PBS_PPN=8; PBS_GPUS=1
+PBS_WALLTIME="24:00:00"; PBS_JOIN="oe"; PBS_MAIL="n"
+PBS_LOG_DIR="$PROJECT_ROOT/logs"
+PBS_TWO_GPU_PPN=48
+PBS_GPUS_PER_NODE=2
+
+ANALYSIS_WINDOW="last50"
+CONTACT_CUTOFF=4.0; HBOND_HA_CUTOFF=2.5; HBOND_DA_CUTOFF=3.5; HBOND_ANGLE=120
+CONTACT_STRIDE=10; SASA_STRIDE=10
+MMPBSA_METHOD="gb"; MMPBSA_IGB=5; MMPBSA_SALTCON=0.12
+MMPBSA_INTERVAL=100; MMPBSA_DECOMP="auto"; MMPBSA_RADII="$RADII"
+RNA_RESRANGE="1-26"
+LOOP_RESIDUES="7,20"
+LIGAND_RING_ATOMS="ring1:C1,C2,C3,C4,C5,C6"
+STACK_TARGETS="7,20,6,8,19,21"

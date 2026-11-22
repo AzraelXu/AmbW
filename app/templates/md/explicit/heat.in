@@ -1,0 +1,17 @@
+NVT heating 0 -> {{TEMP}} K over {{HEAT_NS}} ns; solute heavy atoms restrained
+&cntrl
+  imin=0, irest=0, ntx=1,
+  nstlim={{HEAT_NSTLIM}}, dt={{DT}},
+  ntb=1, ntp=0,
+  ntt=3, gamma_ln={{GAMMA}},
+  tempi=0.0, temp0={{TEMP}},
+  ig={{SEED}},
+  ntc=2, ntf=2, cut={{CUT}},
+{{RESTRAINT_BLOCK}}
+  ntpr={{NTPR}}, ntwx={{NTWX}}, ntwr={{NTWR}},
+  ioutfm=1, iwrap=0,
+  nmropt=1,
+/
+&wt type='TEMP0', istep1=0, istep2={{HEAT_NSTLIM}}, value1=0.0, value2={{TEMP}}, &end
+&wt type='END', &end
+{{NMR_LINE}}

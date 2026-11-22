@@ -1,0 +1,1130 @@
+#!/bin/bash
+# =============================================================================
+# amber-kit —— amber_general_workflow 的统一入口
+#
+# 设计原则：
+#   - 本脚本只做"编排"：调用 scripts/ 下已经参数化的实现，不重复科学逻辑。
+#   - 所有体系相关值来自 <project>/config/config.sh 与 <project>/config/systems.tsv。
+#   - 所有 PBS 资源来自 config.sh；模板在 pbs/*.pbs.in。
+#   - 任何会覆盖已有文件的动作默认拒绝，除非显式 --force。
+# =============================================================================
+set -u
+set -o pipefail
+
+KIT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PYTHON_RENDER="${PYTHON_RENDER:-python3}"
+
+die()  { echo "error: $*" >&2; exit 2; }
+warn() { echo "warning: $*" >&2; }
+note() { echo "[amber-kit] $*" >&2; }
+
+usage() {
+cat <<'EOF'
+用法：amber-kit [--project DIR] <command> [options]
+
+命令：
+  init [DIR]                 在当前目录（或 DIR）初始化项目
+  check [--strict]           检查环境、配置、力场/水/离子、PBS 资源
+  build [--label L] [--render-only] [--force]
+                             配体参数化 + tleap 建系 + QC + 推导 masks
+  inputs [--label L] [--rep R] [--print-only] [--force]
+                             生成每个副本的 min/heat/NPT/prod 输入
+  submit <kind> [options]    渲染 PBS 并 qsub
+       equil | prod | prod-chunk | two-gpu | multi-gpu | param | analysis | mmpbsa
+       选项：--label L --rep R --rep2 R --pair L:r,L:r[,...] --chunk C
+             --stage 05_prod_c01 --prev npt.rst7 --dry-run --force
+  status [--queue]           显示进度表
+  analyze [--label L] [--rep R] [--rna] [--force] [--dry-run]
+                             dry trajectory + 结构指标（+ RNA 模块）
+  mmpbsa [--label L] [--rep R] [--method gb|pb] [--check-only] [--dry-run]
+  report                            汇总 per-replica/system 表 + ranking.csv
+  render <template> [--set KEY=VALUE ...]
+                             只渲染模板到 stdout（调试用）
+
+全局选项：
+  --project DIR              指定项目根目录（含 config/config.sh）
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 项目定位与配置
+# ---------------------------------------------------------------------------
+PROJECT_CLI=""
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project) PROJECT_CLI=$2; shift 2;;
+    *) ARGS+=("$1"); shift;;
+  esac
+done
+set -- "${ARGS[@]:-}"
+
+CMD=${1:-}
+[ -n "$CMD" ] || { usage; exit 2; }
+shift || true
+
+find_project() {
+  if [ -n "${AMBER_PROJECT:-}" ]; then
+    printf '%s\n' "$AMBER_PROJECT"
+  elif [ -n "$PROJECT_CLI" ]; then
+    printf '%s\n' "$PROJECT_CLI"
+  else
+    local d=$PWD
+    while [ -n "$d" ] && [ "$d" != "/" ]; do
+      if [ -f "$d/config/config.sh" ]; then printf '%s\n' "$d"; return; fi
+      d=$(dirname "$d")
+    done
+    if [ -f "$KIT_DIR/config/config.sh" ]; then
+      printf '%s\n' "$KIT_DIR"
+    else
+      die "找不到 config/config.sh；请在项目根目录运行，或设置 AMBER_PROJECT，或用 --project DIR"
+    fi
+  fi
+}
+
+load_config() {
+  local root=$1
+  [ -f "$root/config/config.sh" ] || die "缺少 $root/config/config.sh"
+  # shellcheck disable=SC1090
+  source "$root/config/config.sh"
+  PROJECT_ROOT=$root
+  : "${PROJECT_NAME:=my_project}"
+  : "${SYSTEM_TYPE:=rna-ligand}"
+  : "${RECEPTOR_PDB:=inputs/receptor.pdb}"
+  : "${RECEPTOR_MODEL:=}"
+  : "${LIGAND_RESNAME:=LIG}"
+  : "${LIGAND_CHARGE:=}"
+  : "${GAFF:=gaff2}"
+  : "${RECEPTOR_FF:=RNA.YIL}"
+  : "${SOLVENT:=explicit}"
+  : "${WATER:=tip3p}"
+  : "${BOX:=oct}"
+  : "${PAD:=10.0}"
+  : "${CATION:=K+}"
+  : "${ANION:=Cl-}"
+  : "${COUNTERION:=cation}"
+  : "${SALT_PAIRS:=0}"
+  : "${RADII:=mbondi2}"
+  : "${IGB:=5}"
+  : "${RESTRAINT_MASK:=auto}"
+  : "${RECEPTOR_MASK:=auto}"
+  : "${LIGAND_MASK:=auto}"
+  : "${STRIP_MASK:=:WAT,K+,Cl-,Na+}"
+  : "${ANCHOR_MASK:=}"
+  : "${FIXED_MASK:=}"
+  : "${HEAT_NS:=2}"
+  : "${RELEASE_STAGES:=10}"
+  : "${RELEASE_NS:=1}"
+  : "${PROD_CHUNKS:=4}"
+  : "${PROD_CHUNK_NS:=25}"
+  : "${DT:=0.002}"
+  : "${TRAJ_INTERVAL_PS:=10}"
+  : "${SEED_BASE:=20261001}"
+  : "${PBS_LOG_DIR:=$PROJECT_ROOT/logs}"
+  : "${PBS_QUEUE:=batch}"
+  : "${PBS_NODES:=1}"
+  : "${PBS_PPN:=8}"
+  : "${PBS_GPUS:=1}"
+  : "${PBS_WALLTIME:=24:00:00}"
+  : "${PBS_JOIN:=oe}"
+  : "${PBS_MAIL:=n}"
+  : "${PBS_TWO_GPU_PPN:=48}"
+  : "${PBS_GPUS_PER_NODE:=2}"
+  : "${MPIRUN:=mpirun}"
+  : "${PY_QC:=python3}"
+  : "${PY_ANALYSIS:=python3}"
+  : "${AMBER_SH:=/opt/software/amber22/amber.sh}"
+  case "$AMBER_SH" in /*) ;; *) AMBER_SH="$PROJECT_ROOT/$AMBER_SH";; esac
+  : "${ANALYSIS_WINDOW:=last50}"
+  : "${CONTACT_CUTOFF:=4.0}"
+  : "${HBOND_HA_CUTOFF:=2.5}"
+  : "${HBOND_DA_CUTOFF:=3.5}"
+  : "${HBOND_ANGLE:=120}"
+  : "${CONTACT_STRIDE:=10}"
+  : "${SASA_STRIDE:=10}"
+  : "${MMPBSA_METHOD:=gb}"
+  : "${MMPBSA_IGB:=5}"
+  : "${MMPBSA_SALTCON:=0.12}"
+  : "${MMPBSA_INTERVAL:=100}"
+  : "${MMPBSA_DECOMP:=auto}"
+  : "${MMPBSA_RADII:=$RADII}"
+  : "${LOOP_RESIDUES:=}"
+  : "${LIGAND_RING_ATOMS:=}"
+  : "${STACK_TARGETS:=}"
+  : "${RNA_RESRANGE:=}"
+  export AMBER_MD_PYTHON="$PY_QC"
+  export AMBER_MD_AMBER_SH="$AMBER_SH"
+}
+
+systems_rows() {
+  local file=$1
+  [ -f "$file" ] || die "缺少 systems.tsv: $file"
+  # Unit separator preserves empty fields (IFS=tab would collapse them).
+  awk -F'\t' 'BEGIN{OFS="\034"}
+    /^[[:space:]]*#/ {next}
+    /^[[:space:]]*$/ {next}
+    $1 == "label" {next}
+    {print $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11}' "$file"
+}
+
+valid_label() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+model_dir_for() {
+  local label=$1 model=${2:-}
+  if [ -n "$model" ] && [ "$model" != "-" ]; then
+    printf '%s/systems/%s/model_%02d' "$PROJECT_ROOT" "$label" "$model"
+  else
+    printf '%s/systems/%s' "$PROJECT_ROOT" "$label"
+  fi
+}
+
+replica_dir_for() {
+  printf '%s/md/%s/r%s' "$PROJECT_ROOT" "$1" "$2"
+}
+
+rep_model() {
+  # rep_model "7,11,10" 2 -> 11 ; empty/single -> ""
+  local models=$1 pos=$2
+  if [ -z "$models" ] || [ "$models" = "-" ]; then
+    printf ''
+    return
+  fi
+  local n
+  n=$(awk -F, '{print NF}' <<<"$models")
+  if [ "$n" -le 1 ]; then
+    printf '%s' "$models"
+    return
+  fi
+  awk -F, -v p="$pos" '{print $p}' <<<"$models"
+}
+
+seed_for() {
+  local base=$1 rep=$2
+  if [ -z "$base" ] || [ "$base" = "-" ]; then base=$SEED_BASE; fi
+  printf '%d' $((base + rep - 1))
+}
+
+is_holo() {
+  [[ "$SYSTEM_TYPE" == *-ligand* ]]
+}
+
+charge_for_row() {
+  local c=${1:-}
+  if [ -z "$c" ] || [ "$c" = "-" ]; then c=${LIGAND_CHARGE:-}; fi
+  printf '%s' "$c"
+}
+
+resname_for_row() {
+  local r=${1:-}
+  if [ -z "$r" ] || [ "$r" = "-" ]; then r=${LIGAND_RESNAME:-LIG}; fi
+  printf '%s' "$r"
+}
+
+receptor_type() {
+  case "$SYSTEM_TYPE" in
+    rna-*) printf 'rna' ;;
+    protein-*) printf 'protein' ;;
+    *) die "SYSTEM_TYPE 必须是 rna-ligand|protein-ligand|rna-apo|protein-apo" ;;
+  esac
+}
+
+pdb_has_resname() {
+  local pdb=$1 rn=$2
+  awk -v rn="$rn" '
+    substr($0,1,6) ~ /^(ATOM  |HETATM)/ && substr($0,18,3) ~ rn {found=1}
+    END{exit(found?0:1)}' "$pdb"
+}
+
+load_masks_env() {
+  local modeldir=$1
+  if [ -f "$modeldir/masks.env" ]; then
+    # shellcheck disable=SC1090
+    . "$modeldir/masks.env"
+    return 0
+  fi
+  return 1
+}
+
+derive_masks() {
+  local modeldir=$1 topname=$2 resname=${3:-}
+  local args=(--prmtop "$modeldir/$topname.prmtop" --json "$modeldir/masks.json"
+              --env "$modeldir/masks.env" --force)
+  if [ -n "$resname" ] && [ "$resname" != "-" ]; then
+    args+=(--ligand-resname "$resname")
+  fi
+  "$PY_QC" -I "$KIT_DIR/scripts/residue_masks.py" "${args[@]}" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# init
+# ---------------------------------------------------------------------------
+cmd_init() {
+  local dest="${1:-}"
+  local force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift;;
+      -*) die "init: unknown option $1";;
+      *) dest=$1; shift;;
+    esac
+  done
+
+  if [ -n "$dest" ]; then
+    [ -e "$dest" ] && [ "$force" -eq 0 ] && die "目标已存在：$dest（用 --force 覆盖）"
+    mkdir -p "$dest" || die "无法创建 $dest"
+    for item in bin scripts templates pbs docs config README.md TUTORIAL.md; do
+      [ -e "$KIT_DIR/$item" ] || continue
+      cp -a "$KIT_DIR/$item" "$dest/" || die "复制 $item 失败"
+    done
+    find "$dest" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+    PROJECT_ROOT=$(cd "$dest" && pwd)
+  else
+    PROJECT_ROOT=${PROJECT_CLI:-$PWD}
+  fi
+
+  mkdir -p "$PROJECT_ROOT"/{inputs,ligands,systems,md,analysis,logs}
+  mkdir -p "$PROJECT_ROOT"/analysis/{cpptraj,python,mmpbsa,tables}
+
+  if [ ! -f "$PROJECT_ROOT/config/config.sh" ] || [ "$force" -eq 1 ]; then
+    cp "$PROJECT_ROOT/config/config.example.sh" "$PROJECT_ROOT/config/config.sh"
+    note "写入 $PROJECT_ROOT/config/config.sh"
+  else
+    note "保留已有 config/config.sh"
+  fi
+  if [ ! -f "$PROJECT_ROOT/config/systems.tsv" ] || [ "$force" -eq 1 ]; then
+    cp "$PROJECT_ROOT/config/systems.example.tsv" "$PROJECT_ROOT/config/systems.tsv"
+    note "写入 $PROJECT_ROOT/config/systems.tsv"
+  else
+    note "保留已有 config/systems.tsv"
+  fi
+
+  cat <<EOF
+
+项目已初始化：$PROJECT_ROOT
+下一步：
+  1. 把受体/配体 PDB 放进 inputs/（或修改 config.sh 的 RECEPTOR_PDB）
+  2. 编辑 config/config.sh：SYSTEM_TYPE、RECEPTOR_FF、WATER、LIGAND_CHARGE ...
+  3. 编辑 config/systems.tsv：每个配体一行
+  4. amber-kit check
+  5. amber-kit build
+  6. amber-kit inputs
+  7. amber-kit submit equil --dry-run   # 先检查 PBS 头和命令
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# check
+# ---------------------------------------------------------------------------
+cmd_check() {
+  local strict=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --strict) strict=1; shift;;
+      *) die "check: unknown option $1";;
+    esac
+  done
+  local root; root=$(find_project)
+  load_config "$root"
+  local failures=0
+  check_file() { [ -f "$1" ] || { echo "FAIL 文件不存在: $1" >&2; failures=$((failures+1)); }; }
+  check_file "$AMBER_SH"
+  check_file "$PROJECT_ROOT/config/systems.tsv"
+  [ -f "$PROJECT_ROOT/config/config.sh" ] || { echo "FAIL 缺少 config/config.sh" >&2; failures=$((failures+1)); }
+
+  case "$SYSTEM_TYPE" in
+    rna-ligand|protein-ligand|rna-apo|protein-apo) ;;
+    *) echo "FAIL SYSTEM_TYPE=$SYSTEM_TYPE" >&2; failures=$((failures+1));;
+  esac
+  case "$SOLVENT" in explicit|implicit) ;; *) echo "FAIL SOLVENT=$SOLVENT" >&2; failures=$((failures+1));; esac
+  case "$BOX" in oct|rect) ;; *) echo "FAIL BOX=$BOX" >&2; failures=$((failures+1));; esac
+  if [ "$IGB" = 5 ] && [ "$RADII" != mbondi2 ]; then
+    echo "FAIL igb=5 需要 RADII=mbondi2（当前 $RADII）" >&2; failures=$((failures+1))
+  fi
+  if [ "$IGB" = 8 ] && [ "$RADII" != mbondi3 ]; then
+    echo "FAIL igb=8 需要 RADII=mbondi3（当前 $RADII）" >&2; failures=$((failures+1))
+  fi
+  case "$RECEPTOR_FF:$WATER" in
+    ff19SB:tip3p) warn "ff19SB 推荐 OPC，不是 TIP3P";;
+    ff14SB:opc) warn "ff14SB 通常配 TIP3P";;
+    RNA.*:opc|RNA.*:spce|RNA.*:tip4pd|RNA.*:fb3) warn "$RECEPTOR_FF 通常配 TIP3P";;
+  esac
+  [[ "$PBS_WALLTIME" =~ ^[0-9]{1,3}:[0-9]{2}:[0-9]{2}$ ]] || {
+    echo "FAIL PBS_WALLTIME 格式应为 HH:MM:SS: $PBS_WALLTIME" >&2; failures=$((failures+1)); }
+  for v in PBS_NODES PBS_PPN PBS_GPUS PBS_TWO_GPU_PPN PBS_GPUS_PER_NODE; do
+    local val=${!v}
+    [[ "$val" =~ ^[0-9]+$ ]] || { echo "FAIL $v 不是整数: $val" >&2; failures=$((failures+1)); }
+  done
+  if [ "${PBS_GPUS:-0}" -gt 1 ] 2>/dev/null; then
+    warn "PBS_GPUS=$PBS_GPUS：单个 pmemd.cuda 只用 1 张 GPU；多副本请用 submit multi-gpu"
+  fi
+  if [ "${PBS_GPUS_PER_NODE:-2}" -lt 1 ] 2>/dev/null; then
+    echo "FAIL PBS_GPUS_PER_NODE 必须 >= 1" >&2; failures=$((failures+1))
+  fi
+
+  if command -v "$PY_QC" >/dev/null 2>&1; then
+    "$PY_QC" -I -c 'import parmed, numpy' >/dev/null 2>&1 || {
+      echo "FAIL $PY_QC 不能 import parmed,numpy（QC 需要）" >&2; failures=$((failures+1)); }
+  else
+    echo "FAIL PY_QC 不存在: $PY_QC" >&2; failures=$((failures+1))
+  fi
+  if command -v "$PY_ANALYSIS" >/dev/null 2>&1; then
+    "$PY_ANALYSIS" -I -c 'import MDAnalysis, numpy, scipy' >/dev/null 2>&1 || {
+      echo "FAIL $PY_ANALYSIS 不能 import MDAnalysis,numpy,scipy（分析需要）" >&2; failures=$((failures+1)); }
+    # shapely 只有 RNA 堆积分析（analyze_stacking.py）需要；缺失时警告而非硬失败，
+    # 否则蛋白体系的 check --strict 也会被卡住。
+    "$PY_ANALYSIS" -I -c 'import shapely' >/dev/null 2>&1 || {
+      warn "$PY_ANALYSIS 缺少 shapely：仅 RNA 堆积分析 analyze_stacking.py 需要"; }
+  else
+    echo "FAIL PY_ANALYSIS 不存在: $PY_ANALYSIS" >&2; failures=$((failures+1))
+  fi
+
+  local rows=0
+  while IFS=$'\034' read -r label ligand_pdb charge resname models replicas seed_base control experimental exptype notes; do
+    rows=$((rows+1))
+    [ -n "$label" ] || continue
+    valid_label "$label" || { echo "FAIL 非法 label: $label" >&2; failures=$((failures+1)); continue; }
+    if is_holo; then
+      local ch; ch=$(charge_for_row "$charge")
+      local rn; rn=$(resname_for_row "$resname")
+      [ -n "$ch" ] || { echo "FAIL $label 缺少 charge（systems.tsv 或 LIGAND_CHARGE）" >&2; failures=$((failures+1)); }
+      [ -n "$rn" ] || { echo "FAIL $label 缺少 resname" >&2; failures=$((failures+1)); }
+      if [ -n "$ligand_pdb" ] && [ "$ligand_pdb" != "-" ]; then
+        if [ ! -f "$PROJECT_ROOT/$ligand_pdb" ] && [ ! -f "$ligand_pdb" ]; then
+          if [ "$strict" -eq 1 ]; then
+            echo "FAIL $label 配体 PDB 不存在: $ligand_pdb" >&2; failures=$((failures+1))
+          else
+            warn "$label 配体 PDB 尚不存在: $ligand_pdb"
+          fi
+        fi
+      fi
+    fi
+    [ -n "$models" ] && [[ "$models" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
+      [ -z "$models" ] || { echo "FAIL $label models 格式: $models" >&2; failures=$((failures+1)); }; }
+    [ -n "$replicas" ] && [[ "$replicas" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
+      [ -z "$replicas" ] || { echo "FAIL $label replicas 格式: $replicas" >&2; failures=$((failures+1)); }; }
+  done < <(systems_rows "$PROJECT_ROOT/config/systems.tsv")
+  [ "$rows" -gt 0 ] || { echo "FAIL systems.tsv 没有数据行" >&2; failures=$((failures+1)); }
+
+  if [ "$failures" -eq 0 ]; then
+    echo "OK  config=$PROJECT_ROOT/config/config.sh  systems=$rows"
+    echo "    SYSTEM_TYPE=$SYSTEM_TYPE  FF=$RECEPTOR_FF  WATER=$WATER  RADII=$RADII  IGB=$IGB"
+    echo "    PBS queue=$PBS_QUEUE nodes=$PBS_NODES ppn=$PBS_PPN gpus=$PBS_GPUS walltime=$PBS_WALLTIME"
+    return 0
+  fi
+  echo "检查失败：$failures 项" >&2
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+cmd_build() {
+  local only_label="" render_only=0 force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --label) only_label=$2; shift 2;;
+      --render-only) render_only=1; shift;;
+      --force) force=1; shift;;
+      *) die "build: unknown option $1";;
+    esac
+  done
+  local root; root=$(find_project); load_config "$root"
+  [ -f "$AMBER_SH" ] || die "AMBER_SH 不存在: $AMBER_SH"
+  # shellcheck disable=SC1090
+  source "$AMBER_SH"
+  command -v tleap >/dev/null 2>&1 || die "tleap 不在 PATH（source amber.sh 失败？）"
+  command -v pdb4amber >/dev/null 2>&1 || die "pdb4amber 不在 PATH"
+
+  local found=0
+  while IFS=$'\034' read -r label ligand_pdb charge resname models replicas seed_base control experimental exptype notes; do
+    [ -n "$label" ] || continue
+    if [ -n "$only_label" ] && [ "$label" != "$only_label" ]; then continue; fi
+    found=$((found+1))
+    valid_label "$label" || die "非法 label: $label"
+    local charge_use; charge_use=$(charge_for_row "$charge")
+    local resname_use; resname_use=$(resname_for_row "$resname")
+    if is_holo; then
+      [ -n "$charge_use" ] || die "$label: LIGAND_CHARGE/charge 不能为空（必须手填净电荷）"
+      [[ "$charge_use" =~ ^-?[0-9]+$ ]] || die "$label: charge 必须是整数: $charge_use"
+      [ -n "$resname_use" ] || die "$label: 缺少配体 resname"
+    fi
+
+    local rec_src="$RECEPTOR_PDB"
+    case "$rec_src" in /*) ;; *) rec_src="$PROJECT_ROOT/$rec_src";; esac
+    [ -f "$rec_src" ] || die "$label: 受体 PDB 不存在: $rec_src"
+
+    local model_list=()
+    if [ -n "$models" ] && [ "$models" != "-" ]; then
+      IFS=',' read -r -a model_list <<<"$models"
+    elif [ -n "$RECEPTOR_MODEL" ]; then
+      model_list=("$RECEPTOR_MODEL")
+    else
+      model_list=("")
+    fi
+
+    local template_dir="$PROJECT_ROOT/ligands/$label/template"
+    local template_mol2="$template_dir/lig.mol2"
+    local template_frcmod="$template_dir/lig.frcmod"
+
+    local mi
+    for mi in "${model_list[@]}"; do
+      local model_tag="" outdir topname receptor_pdb ligand_pdb_use ligdir
+      if [ -n "$mi" ]; then
+        model_tag=$(printf 'model_%02d' "$mi")
+        outdir="$PROJECT_ROOT/systems/$label/$model_tag"
+      else
+        outdir="$PROJECT_ROOT/systems/$label"
+      fi
+      topname=apo; is_holo && topname=complex
+
+      # 1) receptor PDB for this model
+      mkdir -p "$PROJECT_ROOT/inputs"
+      if [ -n "$mi" ]; then
+        receptor_pdb="$PROJECT_ROOT/inputs/${label}_receptor_m$(printf '%02d' "$mi").pdb"
+        if ! "$PY_QC" -I "$KIT_DIR/scripts/extract_model.py" --pdb "$rec_src" --model "$mi" \
+             --out "$receptor_pdb" --force >/dev/null 2>&1; then
+          warn "$label: 受体 PDB 不是多模型（或没有模型 $mi），整套使用 $rec_src"
+          cp -f "$rec_src" "$receptor_pdb"
+        fi
+      else
+        receptor_pdb="$rec_src"
+      fi
+
+      # 2) ligand PDB / split complex
+      ligand_pdb_use=""
+      local split_lig=""
+      if is_holo; then
+        if [ -n "$ligand_pdb" ] && [ "$ligand_pdb" != "-" ]; then
+          case "$ligand_pdb" in /*) ligand_pdb_use="$ligand_pdb";; *) ligand_pdb_use="$PROJECT_ROOT/$ligand_pdb";; esac
+          [ -f "$ligand_pdb_use" ] || die "$label: 配体 PDB 不存在: $ligand_pdb_use"
+          if [ -n "$mi" ]; then
+            local lig_model="$PROJECT_ROOT/inputs/${label}_ligand_m$(printf '%02d' "$mi").pdb"
+            "$PY_QC" -I "$KIT_DIR/scripts/extract_model.py" --pdb "$ligand_pdb_use" --model "$mi" \
+              --out "$lig_model" --force >/dev/null 2>&1 || cp -f "$ligand_pdb_use" "$lig_model"
+            ligand_pdb_use="$lig_model"
+          fi
+        fi
+
+        if pdb_has_resname "$receptor_pdb" "$resname_use"; then
+          local split_dir="$PROJECT_ROOT/inputs/${label}_split${model_tag:+_$model_tag}"
+          mkdir -p "$split_dir"
+          "$PY_QC" -I "$KIT_DIR/scripts/split_complex.py" --pdb "$receptor_pdb" --model 1 \
+            --ligand-resname "$resname_use" --out-resname "$resname_use" \
+            --receptor-out "$split_dir/receptor.pdb" --ligand-out "$split_dir/ligand.pdb" \
+            --complex-ref-out "$split_dir/complex_ref.pdb" --force >/dev/null || \
+            die "$label: split_complex 失败"
+          receptor_pdb="$split_dir/receptor.pdb"
+          split_lig="$split_dir/ligand.pdb"
+          if [ -z "$ligand_pdb_use" ]; then ligand_pdb_use="$split_lig"; fi
+        fi
+        [ -n "$ligand_pdb_use" ] && [ -f "$ligand_pdb_use" ] || \
+          die "$label: 找不到配体 PDB（ligand_pdb 为空且受体 PDB 不含 $resname_use）"
+      fi
+
+      # 3) ligand parameters: template + per-model transplant
+      ligdir="$template_dir"
+      if is_holo; then
+        if [ ! -s "$template_mol2" ] || [ "$force" -eq 1 ]; then
+          if [ "$render_only" -eq 1 ] && [ ! -s "$template_mol2" ]; then
+            die "$label: --render-only 需要已有 $template_mol2（先完整跑一次 build）"
+          fi
+          local pargs=(--pdb "$ligand_pdb_use" --charge "$charge_use" --resname "$resname_use"
+                       --gaff "$GAFF" --outdir "$template_dir")
+          [ "$force" -eq 1 ] && pargs+=(--force)
+          "$KIT_DIR/scripts/param_ligand.sh" "${pargs[@]}" || die "$label: param_ligand 失败"
+        fi
+        if [ -n "$mi" ]; then
+          ligdir="$PROJECT_ROOT/ligands/$label/$model_tag"
+          if [ ! -s "$ligdir/lig.mol2" ] || [ "$force" -eq 1 ]; then
+            local targs=(--pdb "$ligand_pdb_use" --charge "$charge_use" --resname "$resname_use"
+                         --gaff "$GAFF" --outdir "$ligdir"
+                         --transplant "$template_mol2" --onto "$ligand_pdb_use")
+            [ "$force" -eq 1 ] && targs+=(--force)
+            "$KIT_DIR/scripts/param_ligand.sh" "${targs[@]}" || die "$label: transplant 失败"
+          fi
+        fi
+      fi
+
+      # 4) tleap build
+      local bargs=(--type "$SYSTEM_TYPE" --receptor "$receptor_pdb"
+                   --ff "$RECEPTOR_FF" --solvent "$SOLVENT" --box "$BOX" --pad "$PAD"
+                   --cation "$CATION" --anion "$ANION" --counterion "$COUNTERION"
+                   --salt-pairs "$SALT_PAIRS" --radii "$RADII" --igb "$IGB"
+                   --outdir "$outdir" --top-name "$topname")
+      [ "$SOLVENT" = explicit ] && bargs+=(--water "$WATER")
+      if is_holo; then
+        bargs+=(--ligand "$ligdir/lig.mol2" --frcmod "$ligdir/lig.frcmod"
+                --lig-resname "$resname_use" --ligand-pdb "$ligand_pdb_use" --gaff "$GAFF")
+      fi
+      [ "$render_only" -eq 1 ] && bargs+=(--render-only)
+      [ "$force" -eq 1 ] && bargs+=(--force)
+      note "$label ${model_tag:-single}: build_system -> $outdir"
+      "$KIT_DIR/scripts/build_system.sh" "${bargs[@]}" || die "$label: build_system 失败"
+
+      if [ "$render_only" -eq 0 ]; then
+        [ -s "$outdir/$topname.prmtop" ] || die "$label: 没有生成 $outdir/$topname.prmtop"
+        local lig_for_masks=""; is_holo && lig_for_masks=$resname_use
+        derive_masks "$outdir" "$topname" "$lig_for_masks"
+        note "$label ${model_tag:-single}: masks -> $outdir/masks.env"
+      fi
+    done
+  done < <(systems_rows "$PROJECT_ROOT/config/systems.tsv")
+  [ "$found" -gt 0 ] || die "没有匹配的体系（--label $only_label）"
+}
+
+# ---------------------------------------------------------------------------
+# inputs
+# ---------------------------------------------------------------------------
+cmd_inputs() {
+  local only_label="" only_rep="" print_only=0 force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --label) only_label=$2; shift 2;;
+      --rep) only_rep=$2; shift 2;;
+      --print-only) print_only=1; shift;;
+      --force) force=1; shift;;
+      *) die "inputs: unknown option $1";;
+    esac
+  done
+  local root; root=$(find_project); load_config "$root"
+  local rtype; rtype=$(receptor_type)
+  local found=0
+  while IFS=$'\034' read -r label ligand_pdb charge resname models replicas seed_base control experimental exptype notes; do
+    [ -n "$label" ] || continue
+    if [ -n "$only_label" ] && [ "$label" != "$only_label" ]; then continue; fi
+    [ -n "$replicas" ] || replicas=1
+    local rep
+    for rep in ${replicas//,/ }; do
+      if [ -n "$only_rep" ] && [ "$rep" != "$only_rep" ]; then continue; fi
+      found=$((found+1))
+      local model; model=$(rep_model "$models" "$rep")
+      local modeldir; modeldir=$(model_dir_for "$label" "$model")
+      local repdir; repdir=$(replica_dir_for "$label" "$rep")
+      local topname=apo; is_holo && topname=complex
+      [ -s "$modeldir/$topname.prmtop" ] || die "$label r$rep: 缺少 $modeldir/$topname.prmtop（先 amber-kit build）"
+
+      if [ "$print_only" -eq 0 ]; then
+        mkdir -p "$repdir"
+        local rel
+        rel=$("$PY_QC" -I -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
+              "$modeldir/$topname.prmtop" "$repdir")
+        ln -sfn "$rel" "$repdir/$topname.prmtop"
+        rel=$("$PY_QC" -I -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
+              "$modeldir/$topname.inpcrd" "$repdir")
+        ln -sfn "$rel" "$repdir/$topname.inpcrd"
+      fi
+
+      # masks: config 非 auto 优先，否则用 masks.env
+      local mask_use=$RESTRAINT_MASK
+      if [ "$mask_use" = auto ]; then
+        if load_masks_env "$modeldir"; then
+          mask_use=$RESTRAINT_MASK
+        else
+          local rn_for_masks=""; is_holo && rn_for_masks=$(resname_for_row "$resname")
+          derive_masks "$modeldir" "$topname" "$rn_for_masks" || die "$label r$rep: 无法推导 masks"
+          load_masks_env "$modeldir" || die "$label r$rep: masks.env 缺失"
+          mask_use=$RESTRAINT_MASK
+        fi
+      fi
+
+      local seed; seed=$(seed_for "$seed_base" "$rep")
+      local args=(--out "$repdir" --seed "$seed" --receptor-type "$rtype"
+                  --solvent "$SOLVENT" --restraint-mask "$mask_use"
+                  --prmtop "$modeldir/$topname.prmtop"
+                  --heat-ns "$HEAT_NS" --release-stages "$RELEASE_STAGES"
+                  --release-ns "$RELEASE_NS" --prod-chunks "$PROD_CHUNKS"
+                  --prod-chunk-ns "$PROD_CHUNK_NS" --dt "$DT"
+                  --traj-interval-ps "$TRAJ_INTERVAL_PS")
+      if is_holo; then
+        local resname_use; resname_use=$(resname_for_row "$resname")
+        args+=(--ligand-resname "$resname_use")
+      fi
+      if [ "$SOLVENT" = implicit ]; then args+=(--igb "$IGB" --saltcon "$MMPBSA_SALTCON"); fi
+      [ "$print_only" -eq 1 ] && args+=(--print-only)
+      [ "$force" -eq 1 ] && args+=(--force)
+      note "$label r$rep: setup_md_inputs (model ${model:-single}, seed $seed)"
+      "$PY_QC" -I "$KIT_DIR/scripts/setup_md_inputs.py" "${args[@]}" || die "$label r$rep: setup_md_inputs 失败"
+    done
+  done < <(systems_rows "$PROJECT_ROOT/config/systems.tsv")
+  [ "$found" -gt 0 ] || die "没有匹配的副本"
+}
+
+# ---------------------------------------------------------------------------
+# submit
+# ---------------------------------------------------------------------------
+render_pbs() {
+  local template=$1 out=$2; shift 2
+  "$PYTHON_RENDER" -I "$KIT_DIR/scripts/render_template.py" "$template" \
+    --out "$out" --force --allow-unused "$@" || die "渲染失败: $template"
+}
+
+qsub_from() {
+  local dir=$1 script=$2 dry=$3
+  if [ "$dry" -eq 1 ]; then
+    echo "DRY-RUN: (cd $dir && qsub $script)"
+  else
+    ( cd "$dir" && qsub "$script" ) || die "qsub 失败: $dir/$script"
+  fi
+}
+
+read_run_config_lists() {
+  local rc=$1
+  RELEASE_STEMS=$("$PY_QC" -I -c 'import json,sys; c=json.load(open(sys.argv[1])); print(" ".join(x[:-3] for x in c["release"]["files"]))' "$rc")
+  PROD_STEMS=$("$PY_QC" -I -c 'import json,sys; c=json.load(open(sys.argv[1])); print(" ".join(x[:-3] for x in c["production"]["files"]))' "$rc")
+  LAST_RELEASE=$("$PY_QC" -I -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c["release"]["files"][-1][:-3] if c["release"]["files"] else "03_heat")' "$rc")
+  LAST_PROD=$("$PY_QC" -I -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c["production"]["files"][-1][:-3])' "$rc")
+}
+
+cmd_submit() {
+  local kind=${1:-}; [ -n "$kind" ] || die "submit 需要 kind: equil|prod|prod-chunk|two-gpu|param|analysis|mmpbsa"
+  shift || true
+  local only_label="" only_rep="" rep2="" pair="" chunk="" stage_use="" prev_use="" dry=0 force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --label) only_label=$2; shift 2;;
+      --rep) only_rep=$2; shift 2;;
+      --rep2) rep2=$2; shift 2;;
+      --pair) pair=$2; shift 2;;
+      --chunk) chunk=$2; shift 2;;
+      --stage) stage_use=$2; shift 2;;
+      --prev) prev_use=$2; shift 2;;
+      --dry-run) dry=1; shift;;
+      --force) force=1; shift;;
+      *) die "submit: unknown option $1";;
+    esac
+  done
+  local root; root=$(find_project); load_config "$root"
+  mkdir -p "${PBS_LOG_DIR}" || die "无法创建 PBS_LOG_DIR: $PBS_LOG_DIR"
+  local found=0
+  local jobbase; jobbase=$(printf '%s' "${PROJECT_NAME}_${kind}" | tr -c 'A-Za-z0-9_.' '_')
+
+  while IFS=$'\034' read -r label ligand_pdb charge resname models replicas seed_base control experimental exptype notes; do
+    [ -n "$label" ] || continue
+    if [ -n "$only_label" ] && [ "$label" != "$only_label" ]; then continue; fi
+    [ -n "$replicas" ] || replicas=1
+
+    if [ "$kind" = param ]; then
+      found=$((found+1))
+      local charge_use; charge_use=$(charge_for_row "$charge")
+      local resname_use; resname_use=$(resname_for_row "$resname")
+      [ -n "$charge_use" ] || die "$label: 缺少配体净电荷（charge 或 LIGAND_CHARGE）"
+      [ -n "$resname_use" ] || die "$label: 缺少配体 resname"
+      local pdb="$ligand_pdb"
+      case "$pdb" in /*) ;; *) pdb="$PROJECT_ROOT/$pdb";; esac
+      [ -f "$pdb" ] || die "$label: 找不到 ligand_pdb=$ligand_pdb（若配体在复合物里，先 amber-kit build）"
+      local out="$PROJECT_ROOT/ligands/$label/template"
+      local script="$PROJECT_ROOT/pbs/param_ligand_${label}.pbs"
+      local sets=(--set "JOB_NAME=${jobbase}_${label}" --set "QUEUE=$PBS_QUEUE"
+                  --set "NODES=$PBS_NODES" --set "PPN=4" --set "WALLTIME=02:00:00"
+                  --set "JOIN=$PBS_JOIN" --set "MAIL=$PBS_MAIL"
+                  --set "LOG_DIR=${PBS_LOG_DIR%/}/" --set "AMBER_SH=$AMBER_SH"
+                  --set "KIT_DIR=$KIT_DIR"
+                  --set "LIGAND_PDB=$pdb" --set "CHARGE=$charge_use" --set "RESNAME=$resname_use"
+                  --set "OUTDIR=$out" --set "GAFF=$GAFF")
+      render_pbs "$KIT_DIR/pbs/run_param_ligand.pbs.in" "$script" "${sets[@]}"
+      qsub_from "$PROJECT_ROOT" "$script" "$dry"
+      continue
+    fi
+
+    if [ "$kind" = two-gpu ] || [ "$kind" = multi-gpu ]; then
+      local specs=()
+      if [ -n "$pair" ]; then
+        IFS=',' read -r -a specs <<<"$pair"
+      else
+        [ -n "$only_rep" ] && [ -n "$rep2" ] || \
+          die "$kind 需要 --rep 和 --rep2，或 --pair label:r1,label:r2[,...]"
+        specs=("$label:$only_rep" "$label:$rep2")
+      fi
+      [ "${#specs[@]}" -ge 1 ] || die "$kind 的 --pair 为空"
+      local first=${specs[0]}
+      local l1=${first%%:*}
+      [ "$label" = "$l1" ] || continue
+      found=$((found+1))
+      local dirs=() spec_name=""
+      local s l r d
+      for s in "${specs[@]}"; do
+        l=${s%%:*}; r=${s##*:}
+        [ -n "$l" ] && [ -n "$r" ] || die "无法解析 --pair 项: $s（应为 label:rep）"
+        d=$(replica_dir_for "$l" "$r")
+        [ -d "$d" ] || die "副本目录不存在: $d"
+        [ -s "$d/run_config.json" ] || die "缺少 $d/run_config.json（先 amber-kit inputs）"
+        for existing in "${dirs[@]:-}"; do
+          [ "$existing" != "$d" ] || die "$kind 的副本目录重复: $d"
+        done
+        dirs+=("$d")
+        spec_name+="_${l}r${r}"
+      done
+      local stage_final=${stage_use:-05_prod_c01}
+      local prev_final=${prev_use:-npt.rst7}
+      local script="${dirs[0]}/${kind}${spec_name}.pbs"
+      local sets=(--set "JOB_NAME=${jobbase}${spec_name}"
+                  --set "QUEUE=$PBS_QUEUE" --set "NODES=1" --set "PPN=$PBS_TWO_GPU_PPN"
+                  --set "WALLTIME=$PBS_WALLTIME" --set "JOIN=$PBS_JOIN" --set "MAIL=$PBS_MAIL"
+                  --set "LOG_DIR=${PBS_LOG_DIR%/}/" --set "AMBER_SH=$AMBER_SH"
+                  --set "STAGE=$stage_final" --set "PREV=$prev_final" --set "TOP=complex.prmtop"
+                  --set "REF=complex.inpcrd")
+      if [ "$kind" = two-gpu ]; then
+        [ "${#dirs[@]}" -eq 2 ] || die "two-gpu 需要恰好 2 个副本（用 multi-gpu 跑更多）"
+        sets+=(--set "REP1_DIR=${dirs[0]}" --set "REP2_DIR=${dirs[1]}")
+        render_pbs "$KIT_DIR/pbs/run_two_gpu.pbs.in" "$script" "${sets[@]}"
+      else
+        [ "${#dirs[@]}" -le "$PBS_GPUS_PER_NODE" ] || \
+          die "multi-gpu: ${#dirs[@]} 个副本超过 PBS_GPUS_PER_NODE=$PBS_GPUS_PER_NODE"
+        sets+=(--set "REP_DIRS=${dirs[*]}" --set "GPUS_PER_NODE=$PBS_GPUS_PER_NODE")
+        render_pbs "$KIT_DIR/pbs/run_multi_gpu.pbs.in" "$script" "${sets[@]}"
+      fi
+      qsub_from "${dirs[0]}" "$script" "$dry"
+      continue
+    fi
+
+    local rep
+    for rep in ${replicas//,/ }; do
+      if [ -n "$only_rep" ] && [ "$rep" != "$only_rep" ]; then continue; fi
+      local repdir; repdir=$(replica_dir_for "$label" "$rep")
+      [ -d "$repdir" ] || die "副本目录不存在: $repdir（先 amber-kit inputs）"
+      local rc="$repdir/run_config.json"
+      [ -f "$rc" ] || die "缺少 $rc（先 amber-kit inputs）"
+      read_run_config_lists "$rc"
+      local topname=apo; is_holo && topname=complex
+      local script sets
+
+      case "$kind" in
+        equil)
+          [ -f "$repdir/$topname.prmtop" ] || die "缺少 $repdir/$topname.prmtop"
+          [ -f "$repdir/$topname.inpcrd" ] || die "缺少 $repdir/$topname.inpcrd"
+          if [ -f "$repdir/npt.rst7" ] && [ "$force" -eq 0 ]; then
+            note "$label r$rep: npt.rst7 已存在，跳过（--force 重投）"; continue
+          fi
+          found=$((found+1))
+          script="$repdir/run_equil.pbs"
+          sets=(--set "JOB_NAME=${jobbase}_${label}_r${rep}"
+                --set "QUEUE=$PBS_QUEUE" --set "NODES=$PBS_NODES" --set "PPN=$PBS_PPN"
+                --set "GPUS=$PBS_GPUS" --set "WALLTIME=$PBS_WALLTIME"
+                --set "JOIN=$PBS_JOIN" --set "MAIL=$PBS_MAIL"
+                --set "LOG_DIR=${PBS_LOG_DIR%/}/" --set "AMBER_SH=$AMBER_SH"
+                --set "MPIRUN=$MPIRUN" --set "TOP=$topname.prmtop" --set "CRD=$topname.inpcrd"
+                --set "MIN1=01_min_restraint" --set "MIN2=02_min_free" --set "HEAT=03_heat"
+                --set "RELEASE_STEMS=$RELEASE_STEMS" --set "LAST_RELEASE=$LAST_RELEASE")
+          render_pbs "$KIT_DIR/pbs/run_equil.pbs.in" "$script" "${sets[@]}"
+          qsub_from "$repdir" "$script" "$dry"
+          ;;
+        prod)
+          [ -f "$repdir/npt.rst7" ] || die "$label r$rep: 缺少 npt.rst7（先完成 equil）"
+          if [ -f "$repdir/prod_final.rst7" ] && [ "$force" -eq 0 ]; then
+            note "$label r$rep: prod_final.rst7 已存在，跳过（--force 重投）"; continue
+          fi
+          found=$((found+1))
+          script="$repdir/run_prod.pbs"
+          sets=(--set "JOB_NAME=${jobbase}_${label}_r${rep}"
+                --set "QUEUE=$PBS_QUEUE" --set "NODES=$PBS_NODES" --set "PPN=$PBS_PPN"
+                --set "GPUS=$PBS_GPUS" --set "WALLTIME=$PBS_WALLTIME"
+                --set "JOIN=$PBS_JOIN" --set "MAIL=$PBS_MAIL"
+                --set "LOG_DIR=${PBS_LOG_DIR%/}/" --set "AMBER_SH=$AMBER_SH"
+                --set "TOP=$topname.prmtop" --set "PROD_STEMS=$PROD_STEMS"
+                --set "LAST_PROD=$LAST_PROD")
+          render_pbs "$KIT_DIR/pbs/run_prod.pbs.in" "$script" "${sets[@]}"
+          qsub_from "$repdir" "$script" "$dry"
+          ;;
+        prod-chunk)
+          [ -n "$chunk" ] || die "prod-chunk 需要 --chunk c01|c02|... 或 05_prod_c01"
+          [[ "$chunk" == 05_prod_c* ]] || chunk=$(printf '05_prod_c%02d' "${chunk#c}")
+          [ -f "$repdir/$chunk.in" ] || die "找不到 $repdir/$chunk.in"
+          [ -f "$repdir/npt.rst7" ] || die "$label r$rep: 缺少 npt.rst7"
+          found=$((found+1))
+          local num=${chunk##*c}
+          local prev
+          if [ "$num" = 01 ]; then
+            prev=npt.rst7
+          else
+            prev=$(printf '05_prod_c%02d.rst7' $((10#$num - 1)))
+          fi
+          script="$repdir/run_${chunk}.pbs"
+          sets=(--set "JOB_NAME=${jobbase}_${label}_r${rep}_${chunk}"
+                --set "QUEUE=$PBS_QUEUE" --set "NODES=$PBS_NODES" --set "PPN=$PBS_PPN"
+                --set "GPUS=$PBS_GPUS" --set "WALLTIME=$PBS_WALLTIME"
+                --set "JOIN=$PBS_JOIN" --set "MAIL=$PBS_MAIL"
+                --set "LOG_DIR=${PBS_LOG_DIR%/}/" --set "AMBER_SH=$AMBER_SH"
+                --set "TOP=$topname.prmtop" --set "CHUNK=$chunk" --set "PREV=$prev")
+          render_pbs "$KIT_DIR/pbs/run_prod_chunk.pbs.in" "$script" "${sets[@]}"
+          qsub_from "$repdir" "$script" "$dry"
+          ;;
+        analysis|mmpbsa)
+          found=$((found+1))
+          script="$repdir/${kind}_${label}_r${rep}.pbs"
+          sets=(--set "JOB_NAME=${jobbase}_${label}_r${rep}"
+                --set "QUEUE=$PBS_QUEUE" --set "NODES=1" --set "PPN=8"
+                --set "WALLTIME=04:00:00" --set "JOIN=$PBS_JOIN" --set "MAIL=$PBS_MAIL"
+                --set "LOG_DIR=${PBS_LOG_DIR%/}/" --set "AMBER_SH=$AMBER_SH"
+                --set "PROJECT_ROOT=$PROJECT_ROOT" --set "KIT_BIN=$KIT_DIR/bin/amber-kit"
+                --set "LABEL=$label" --set "REP=$rep")
+          if [ "$kind" = analysis ]; then
+            render_pbs "$KIT_DIR/pbs/run_analysis.pbs.in" "$script" "${sets[@]}"
+          else
+            render_pbs "$KIT_DIR/pbs/run_mmpbsa.pbs.in" "$script" "${sets[@]}"
+          fi
+          qsub_from "$repdir" "$script" "$dry"
+          ;;
+        *) die "未知 submit kind: $kind";;
+      esac
+    done
+  done < <(systems_rows "$PROJECT_ROOT/config/systems.tsv")
+  [ "$found" -gt 0 ] || die "没有匹配的作业"
+}
+
+# ---------------------------------------------------------------------------
+# status/render
+# ---------------------------------------------------------------------------
+cmd_status() {
+  local root; root=$(find_project); load_config "$root"
+  local args=("$PROJECT_ROOT" --md-glob 'md/*/r*')
+  [ "${1:-}" = --queue ] && args+=(--queue)
+  bash "$KIT_DIR/scripts/status.sh" "${args[@]}"
+}
+
+cmd_render() {
+  [ $# -ge 1 ] || die "render 需要模板路径"
+  local template=$1; shift
+  "$PYTHON_RENDER" -I "$KIT_DIR/scripts/render_template.py" "$template" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# analyze / mmpbsa / report
+# ---------------------------------------------------------------------------
+run_or_echo() {
+  if [ "${DRY:-0}" -eq 1 ]; then
+    printf 'DRY-RUN:'
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+cmd_analyze() {
+  local only_label="" only_rep="" force=0 dry=0 rna_flag=0 no_sasa=0
+  DRY=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --label) only_label=$2; shift 2;;
+      --rep) only_rep=$2; shift 2;;
+      --force) force=1; shift;;
+      --dry-run) dry=1; DRY=1; shift;;
+      --rna) rna_flag=1; shift;;
+      --no-sasa) no_sasa=1; shift;;
+      *) die "analyze: unknown option $1";;
+    esac
+  done
+  local root; root=$(find_project); load_config "$root"
+  source "$AMBER_SH" >/dev/null 2>&1 || die "source $AMBER_SH 失败"
+  local is_rna=0
+  [ "$rna_flag" -eq 1 ] && is_rna=1
+  case "$SYSTEM_TYPE" in rna-*) is_rna=1;; esac
+  local found=0
+  while IFS=$'\034' read -r label ligand_pdb charge resname models replicas seed_base control experimental exptype notes; do
+    [ -n "$label" ] || continue
+    if [ -n "$only_label" ] && [ "$label" != "$only_label" ]; then continue; fi
+    [ -n "$replicas" ] || replicas=1
+    local rep
+    for rep in ${replicas//,/ }; do
+      if [ -n "$only_rep" ] && [ "$rep" != "$only_rep" ]; then continue; fi
+      found=$((found+1))
+      local model; model=$(rep_model "$models" "$rep")
+      local modeldir; modeldir=$(model_dir_for "$label" "$model")
+      local repdir; repdir=$(replica_dir_for "$label" "$rep")
+      local prefix="${label}_r${rep}"
+      local topname=apo; is_holo && topname=complex
+      local cppdir="$PROJECT_ROOT/analysis/cpptraj"
+      local pydir="$PROJECT_ROOT/analysis/python"
+      local tabdir="$PROJECT_ROOT/analysis/tables"
+      mkdir -p "$cppdir" "$pydir" "$tabdir" 2>/dev/null || true
+
+      local acc_args=(--top "$repdir/$topname.prmtop"
+                      --traj "$repdir/05_prod_c*.nc"
+                      --strip-mask "$STRIP_MASK"
+                      --outdir "$cppdir" --prefix "$prefix" --run)
+      [ -n "$ANCHOR_MASK" ] && acc_args+=(--anchor "$ANCHOR_MASK")
+      [ -n "$FIXED_MASK" ] && acc_args+=(--fixed "$FIXED_MASK")
+      [ "$force" -eq 1 ] && acc_args+=(--force)
+      local resrange=$RNA_RESRANGE
+      if [ "$is_rna" -eq 1 ]; then
+        if [ -z "$resrange" ] && [ -f "$modeldir/masks.env" ]; then
+          # shellcheck disable=SC1090
+          . "$modeldir/masks.env"
+          resrange=$RNA_RESRANGE
+        fi
+        if [ -n "$resrange" ]; then acc_args+=(--nastruct --resrange "$resrange"); fi
+      fi
+      note "$label r$rep: cpptraj dry trajectory"
+      run_or_echo "$PY_ANALYSIS" -I "$KIT_DIR/scripts/make_cpptraj_inputs.py" "${acc_args[@]}" || \
+        die "$label r$rep: cpptraj prep 失败"
+
+      local resname_use=""
+      is_holo && resname_use=$(resname_for_row "$resname")
+      local lig_resname=${resname_use:-LIG}
+      local rec_sel="all"
+      [ -n "$resname_use" ] && rec_sel="all and not resname $resname_use"
+      local ana_args=(--prmtop "$cppdir/${prefix}_dry.prmtop"
+                      --traj "$cppdir/${prefix}_dry.nc"
+                      --label "$label" --rep "$rep"
+                      --receptor-selection "$rec_sel"
+                      --contact-cutoff "$CONTACT_CUTOFF"
+                      --contact-stride "$CONTACT_STRIDE"
+                      --hbond-ha-cutoff "$HBOND_HA_CUTOFF"
+                      --hbond-da-cutoff "$HBOND_DA_CUTOFF"
+                      --hbond-angle "$HBOND_ANGLE"
+                      --out "$pydir/${prefix}.npz"
+                      --summary "$pydir/${prefix}.json")
+      if [ -n "$resname_use" ]; then
+        ana_args+=(--ligand-resname "$resname_use")
+      fi
+      [ "$is_rna" -eq 1 ] && ana_args+=(--rna)
+      [ -n "$LOOP_RESIDUES" ] && ana_args+=(--loop-residues "$LOOP_RESIDUES")
+      local rec_mask=""
+      if [ -f "$modeldir/masks.env" ]; then
+        # shellcheck disable=SC1090
+        . "$modeldir/masks.env"
+        rec_mask=${RECEPTOR_MASK:-}
+      fi
+      if [ "$no_sasa" -eq 0 ] && [ -n "$rec_mask" ] && [ "${no_sasa}" -eq 0 ]; then
+        ana_args+=(--sasa --sasa-stride "$SASA_STRIDE" --receptor-mask "$rec_mask")
+      fi
+      [ "$force" -eq 1 ] && ana_args+=(--force)
+      note "$label r$rep: analyze_replica"
+      run_or_echo "$PY_ANALYSIS" -I "$KIT_DIR/scripts/analyze_replica.py" "${ana_args[@]}" || \
+        die "$label r$rep: analyze_replica 失败"
+
+      if [ -n "$resname_use" ]; then
+        local hb_args=(--prmtop "$cppdir/${prefix}_dry.prmtop"
+                       --traj "$cppdir/${prefix}_dry.nc"
+                       --ligand-resname "$resname_use"
+                       --receptor-selection "$rec_sel"
+                       --out "$pydir/${prefix}_hb.npz"
+                       --summary "$pydir/${prefix}_hb.json" --stride 2)
+        [ "$force" -eq 1 ] && hb_args+=(--force)
+        note "$label r$rep: ligand H-bonds"
+        run_or_echo "$PY_ANALYSIS" -I "$KIT_DIR/scripts/analyze_ligand_hbonds.py" "${hb_args[@]}" || \
+          warn "$label r$rep: H-bond analysis 失败"
+      fi
+
+      if [ "$is_rna" -eq 1 ] && [ -n "$LIGAND_RING_ATOMS" ] && [ -n "$STACK_TARGETS" ]; then
+        local st_args=(--prmtop "$cppdir/${prefix}_dry.prmtop"
+                       --traj "$cppdir/${prefix}_dry.nc"
+                       --ligand-resname "$lig_resname"
+                       --ligand-ring-atoms "$LIGAND_RING_ATOMS"
+                       --target-residues "$STACK_TARGETS"
+                       --out "$pydir/${prefix}_stack.npz" --stride 10)
+        [ "$force" -eq 1 ] && st_args+=(--force)
+        note "$label r$rep: stacking"
+        run_or_echo "$PY_ANALYSIS" -I "$KIT_DIR/scripts/analyze_stacking.py" "${st_args[@]}" || \
+          warn "$label r$rep: stacking 失败"
+      fi
+
+      if [ "$is_rna" -eq 1 ] && [ -n "$resrange" ]; then
+        local na_args=(--prefix "$cppdir/$prefix" --label "$label" --rep "$rep"
+                       --out "$tabdir/nastruct_${prefix}.csv"
+                       --pairs-out "$tabdir/nastruct_pairs_${prefix}.csv")
+        [ "$force" -eq 1 ] && na_args+=(--force)
+        note "$label r$rep: nastruct summary"
+        run_or_echo "$PY_ANALYSIS" -I "$KIT_DIR/scripts/parse_nastruct.py" "${na_args[@]}" || \
+          warn "$label r$rep: nastruct 汇总失败"
+      fi
+    done
+  done < <(systems_rows "$PROJECT_ROOT/config/systems.tsv")
+  [ "$found" -gt 0 ] || die "没有匹配的副本"
+}
+
+cmd_mmpbsa() {
+  local only_label="" only_rep="" method="" check_only=0 dry=0 force=0
+  DRY=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --label) only_label=$2; shift 2;;
+      --rep) only_rep=$2; shift 2;;
+      --method) method=$2; shift 2;;
+      --check-only) check_only=1; shift;;
+      --dry-run) dry=1; DRY=1; shift;;
+      --force) force=1; shift;;
+      *) die "mmpbsa: unknown option $1";;
+    esac
+  done
+  local root; root=$(find_project); load_config "$root"
+  source "$AMBER_SH" >/dev/null 2>&1 || die "source $AMBER_SH 失败"
+  local method_use=${method:-$MMPBSA_METHOD}
+  local found=0
+  while IFS=$'\034' read -r label ligand_pdb charge resname models replicas seed_base control experimental exptype notes; do
+    [ -n "$label" ] || continue
+    if [ -n "$only_label" ] && [ "$label" != "$only_label" ]; then continue; fi
+    [ -n "$replicas" ] || replicas=1
+    local rep
+    for rep in ${replicas//,/ }; do
+      if [ -n "$only_rep" ] && [ "$rep" != "$only_rep" ]; then continue; fi
+      found=$((found+1))
+      local model; model=$(rep_model "$models" "$rep")
+      local modeldir; modeldir=$(model_dir_for "$label" "$model")
+      local repdir; repdir=$(replica_dir_for "$label" "$rep")
+      local prefix="${label}_r${rep}"
+      local topname=apo; is_holo && topname=complex
+      local dry="$PROJECT_ROOT/analysis/cpptraj/${prefix}_dry"
+      [ -s "$dry.nc" ] || die "$label r$rep: 缺少 $dry.nc（先 amber-kit analyze）"
+      local lig_mask="" decomp="" last_res=""
+      if [ -f "$modeldir/masks.env" ]; then
+        # shellcheck disable=SC1090
+        . "$modeldir/masks.env"
+        lig_mask=${LIGAND_MASK:-}
+        last_res=${LAST_SOLUTE_RESID:-}
+      fi
+      [ -n "$lig_mask" ] || lig_mask=${LIGAND_MASK:-}
+      [ -n "$lig_mask" ] && [ "$lig_mask" != auto ] || die "$label r$rep: 无法确定 ligand mask"
+      if [ "$MMPBSA_DECOMP" = auto ]; then
+        [ -n "$last_res" ] || die "$label r$rep: 无法确定 MMPBSA_DECOMP（masks.env 缺 LAST_SOLUTE_RESID）"
+        decomp="1-$last_res"
+      else
+        decomp=$MMPBSA_DECOMP
+      fi
+      local args=(--top "$repdir/$topname.prmtop" --traj "$dry.nc"
+                  --ligand-mask "$lig_mask" --strip-mask "$STRIP_MASK"
+                  --radii "$MMPBSA_RADII" --method "$method_use"
+                  --igb "$MMPBSA_IGB" --saltcon "$MMPBSA_SALTCON"
+                  --interval "$MMPBSA_INTERVAL" --decomp-residues "$decomp"
+                  --outdir "$PROJECT_ROOT/analysis/mmpbsa/${prefix}")
+      [ "$check_only" -eq 1 ] && args+=(--check-only)
+      [ "$force" -eq 1 ] && args+=(--force)
+      note "$label r$rep: MM/${method_use^^}SA"
+      run_or_echo "$KIT_DIR/scripts/mmpbsa_one.sh" "${args[@]}" || \
+        die "$label r$rep: mmpbsa 失败"
+    done
+  done < <(systems_rows "$PROJECT_ROOT/config/systems.tsv")
+  [ "$found" -gt 0 ] || die "没有匹配的副本"
+}
+
+cmd_report() {
+  local root; root=$(find_project); load_config "$root"
+  local args=(--root "$PROJECT_ROOT" --systems "$PROJECT_ROOT/config/systems.tsv"
+              --window "$ANALYSIS_WINDOW" --out "$PROJECT_ROOT/analysis/tables" --force)
+  "$PY_ANALYSIS" -I "$KIT_DIR/scripts/aggregate_results.py" "${args[@]}" || \
+    die "aggregate_results 失败"
+  "$PY_ANALYSIS" -I "$KIT_DIR/scripts/rank_ligands.py" \
+    --root "$PROJECT_ROOT" --systems "$PROJECT_ROOT/config/systems.tsv" \
+    --out "$PROJECT_ROOT/analysis/tables/ranking.csv" --force || \
+    die "rank_ligands 失败"
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+case "$CMD" in
+  init)    cmd_init "$@";;
+  check)   cmd_check "$@";;
+  build)   cmd_build "$@";;
+  inputs)  cmd_inputs "$@";;
+  submit)  cmd_submit "$@";;
+  status)  cmd_status "$@";;
+  analyze) cmd_analyze "$@";;
+  mmpbsa)  cmd_mmpbsa "$@";;
+  report)  cmd_report "$@";;
+  render)  cmd_render "$@";;
+  -h|--help|help) usage;;
+  *) usage; die "未知命令: $CMD";;
+esac

@@ -1,0 +1,3 @@
+label	ligand_pdb	charge	resname	models	replicas	seed_base	control	experimental	experimental_type	notes
+lig1	inputs/lig1.pdb	2	LIG	7,11,10	1,2,3	20261101	0	NA	NA	example RNA ligand
+lig3_p2	inputs/lig3_p2.pdb	2	LIG	15,14,9	1,2,3	20261401	1	NA	NA	control example

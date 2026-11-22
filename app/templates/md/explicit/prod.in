@@ -1,0 +1,15 @@
+Production NPT at {{TEMP}} K, {{PRES}} atm, {{PROD_NS}} ns chunk
+&cntrl
+  imin=0, irest=1, ntx=5,
+  nstlim={{PROD_NSTLIM}}, dt={{DT}},
+  ntb=2, ntp=1,
+  barostat=1, taup={{TAUP}}, pres0={{PRES}}, comp=44.6,
+  ntt=3, gamma_ln={{GAMMA}}, temp0={{TEMP}},
+  ig={{SEED}},
+  ntc=2, ntf=2, cut={{CUT}},
+  ntr=0,
+  ntpr={{NTPR}}, ntwx={{NTWX}}, ntwr={{NTWR}},
+  ioutfm=1, iwrap=0,
+{{NMR_CNTRL}}
+/
+{{NMR_TAIL}}

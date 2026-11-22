@@ -1,0 +1,9 @@
+Minimization 2: unrestrained
+&cntrl
+  imin=1, maxcyc={{MIN_MAXCYC}}, ncyc={{MIN_NCYC}},
+  ntb=1, cut={{CUT}},
+  ntf=1, ntc=1,
+  ntr=0,
+  ntpr={{NTPR}}, ntwx=0, ntwr={{NTWR}},
+  ioutfm=1,
+/

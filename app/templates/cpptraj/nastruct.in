@@ -1,0 +1,5 @@
+parm {{DRY_TOP}}
+trajin {{DRY_NC}} 1 last {{STRIDE}}
+nastruct naout {{PREFIX}}_na {{RESRANGE}} sscalc calcnohb groovecalc 3dna
+run
+quit

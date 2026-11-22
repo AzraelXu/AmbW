@@ -1,0 +1,13 @@
+Short NPT benchmark ({{BENCH_NS}} ns), same settings as production, no trajectory
+&cntrl
+  imin=0, irest=1, ntx=5,
+  nstlim={{BENCH_NSTLIM}}, dt={{DT}},
+  ntb=2, ntp=1,
+  barostat=1, taup={{TAUP}}, pres0={{PRES}}, comp=44.6,
+  ntt=3, gamma_ln={{GAMMA}}, temp0={{TEMP}},
+  ig={{SEED}},
+  ntc=2, ntf=2, cut={{CUT}},
+  ntr=0,
+  ntpr={{NTPR}}, ntwx=0, ntwr={{NTWR}},
+  ioutfm=1, iwrap=0,
+/

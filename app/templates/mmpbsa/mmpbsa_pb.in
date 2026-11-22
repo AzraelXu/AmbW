@@ -1,0 +1,10 @@
+MM/PBSA, single trajectory
+&general
+  startframe={{START}}, endframe={{END}}, interval={{INTERVAL}},
+  verbose=1, keep_files={{KEEP_FILES}},
+{{MASKS}}
+/
+&pb
+  istrng={{ISTRNG}}, radiopt=1, fillratio={{FILLRATIO}}, space={{SPACE}},
+/
+{{DECOMP}}

@@ -1,0 +1,87 @@
+#!/bin/bash
+# =============================================================================
+# 单个生产 chunk（队列 walltime 紧张时使用）
+# 例如 CHUNK=05_prod_c02, PREV=05_prod_c01.rst7
+# =============================================================================
+#PBS -N {{JOB_NAME}}
+#PBS -q {{QUEUE}}
+#PBS -l nodes={{NODES}}:ppn={{PPN}}:gpus={{GPUS}}
+#PBS -l walltime={{WALLTIME}}
+#PBS -j {{JOIN}}
+#PBS -o {{LOG_DIR}}
+#PBS -m {{MAIL}}
+
+set -o pipefail
+
+# 本集群 Torque 未把 #PBS -o 的输出写回 NFS；作业自身再落一份日志到 LOG_DIR。
+exec >>"{{LOG_DIR}}{{JOB_NAME}}.o${PBS_JOBID%%.*}" 2>&1
+
+cd "$PBS_O_WORKDIR" || { echo "无法进入 PBS_O_WORKDIR=$PBS_O_WORKDIR"; exit 1; }
+# 清除继承的 OpenMPI 库路径，避免与 {{AMBER_SH}} 的 OpenMPI 版本混用；
+# 混用不同 libmpi 会让 mpirun/sander.MPI 挂起。
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+  LD_LIBRARY_PATH=$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' \
+    | grep -v -i 'openmpi' | paste -sd: - || true)
+  export LD_LIBRARY_PATH
+fi
+# amber.sh 会读取 LD_LIBRARY_PATH/PERL5LIB/PYTHONPATH；这些变量在 qsub 环境中
+# 可能未导出，set -u 会让 source 直接退出。source 期间临时关闭 nounset。
+set +u
+source "{{AMBER_SH}}" || { echo "source {{AMBER_SH}} 失败"; exit 1; }
+set -u
+
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && [ -n "${PBS_GPUFILE:-}" ] && [ -f "$PBS_GPUFILE" ]; then
+  export CUDA_VISIBLE_DEVICES=$(sed -E 's/.*[^0-9]([0-9]+)$/\1/' "$PBS_GPUFILE" | paste -sd, -)
+fi
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU_ID:-0}}"
+# 单个 pmemd.cuda 只用一张 GPU；若 Torque 分配了多张，取第一张。
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}"
+
+echo "HOST=$(hostname) DIR=$PBS_O_WORKDIR JOB=$PBS_JOBID"
+echo "PBS_GPUFILE=${PBS_GPUFILE:-} CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+
+TOP="{{TOP}}"
+CHUNK="{{CHUNK}}"
+PREV="{{PREV}}"
+
+[ -s "$TOP" ] || { echo "缺少拓扑 $TOP"; exit 1; }
+[ -s "$CHUNK.in" ] || { echo "缺少输入 $CHUNK.in"; exit 1; }
+[ -s "$PREV" ] || { echo "缺少上一段 restart $PREV"; exit 1; }
+
+exec 9>.${CHUNK}.lock
+if command -v flock >/dev/null 2>&1; then
+  flock -n 9 || { echo "另一个作业已持有 .${CHUNK}.lock"; exit 1; }
+fi
+
+# 已完成则跳过（.rst7 + Total wall time + NSTEP>=nstlim）
+chunk_done() {
+  [ -s "$CHUNK.rst7" ] && [ -s "$CHUNK.out" ] || return 1
+  grep -q 'Total wall time' "$CHUNK.out" || return 1
+  local nstlim nstep
+  nstlim=$(sed -n 's/.*nstlim[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$CHUNK.in" | tail -1)
+  if [ -n "$nstlim" ]; then
+    nstep=$(tail -n 2000 "$CHUNK.out" | \
+            sed -n 's/.*NSTEP[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' | tail -1)
+    [ -n "$nstep" ] && [ "$nstep" -ge "$nstlim" ] || return 1
+  fi
+  return 0
+}
+if chunk_done; then
+  echo "SKIP $CHUNK (已完成)"
+  exit 0
+fi
+
+echo "=== RUN $CHUNK (prev=$PREV) $(date) ==="
+rm -f "$CHUNK.rst7" "$CHUNK.out" "$CHUNK.nc" "$CHUNK.mdinfo" "$CHUNK.log"
+pmemd.cuda -O \
+  -i "$CHUNK.in" -o "$CHUNK.out" -p "$TOP" \
+  -c "$PREV" -r "$CHUNK.rst7" -x "$CHUNK.nc" \
+  -inf "$CHUNK.mdinfo" -l "$CHUNK.log"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "FAILED $CHUNK rc=$rc"
+  exit "$rc"
+fi
+grep -E 'ns/day|Performance' "$CHUNK.mdinfo" 2>/dev/null | tail -2 || true
+echo "=== DONE $CHUNK $(date) ==="

@@ -1,0 +1,38 @@
+#!/bin/bash
+# =============================================================================
+# CPU 作业：一个副本的 MM/GBSA（ante-MMPBSA.py + MMPBSA.py）
+# 串行 MMPBSA.py；ppn 给 8 是为了与队列习惯一致，可按需降到 1。
+# =============================================================================
+#PBS -N {{JOB_NAME}}
+#PBS -q {{QUEUE}}
+#PBS -l nodes={{NODES}}:ppn={{PPN}}
+#PBS -l walltime={{WALLTIME}}
+#PBS -j {{JOIN}}
+#PBS -o {{LOG_DIR}}
+#PBS -m {{MAIL}}
+
+set -o pipefail
+
+# 本集群 Torque 未把 #PBS -o 的输出写回 NFS；作业自身再落一份日志到 LOG_DIR。
+exec >>"{{LOG_DIR}}{{JOB_NAME}}.o${PBS_JOBID%%.*}" 2>&1
+
+cd "$PBS_O_WORKDIR" || { echo "无法进入 PBS_O_WORKDIR=$PBS_O_WORKDIR"; exit 1; }
+# 清除继承的 OpenMPI 库路径，避免与 {{AMBER_SH}} 的 OpenMPI 版本混用；
+# 混用不同 libmpi 会让 mpirun/sander.MPI 挂起。
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+  LD_LIBRARY_PATH=$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' \
+    | grep -v -i 'openmpi' | paste -sd: - || true)
+  export LD_LIBRARY_PATH
+fi
+# amber.sh 会读取 LD_LIBRARY_PATH/PERL5LIB/PYTHONPATH；这些变量在 qsub 环境中
+# 可能未导出，set -u 会让 source 直接退出。source 期间临时关闭 nounset。
+set +u
+source "{{AMBER_SH}}" || { echo "source {{AMBER_SH}} 失败"; exit 1; }
+set -u
+
+echo "HOST=$(hostname) DIR=$PBS_O_WORKDIR JOB=$PBS_JOBID"
+"{{KIT_BIN}}" --project "{{PROJECT_ROOT}}" mmpbsa \
+  --label "{{LABEL}}" --rep "{{REP}}" --force
+rc=$?
+echo "mmpbsa exit=$rc"
+exit "$rc"

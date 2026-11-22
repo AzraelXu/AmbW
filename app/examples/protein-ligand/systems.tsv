@@ -1,0 +1,2 @@
+label	ligand_pdb	charge	resname	models	replicas	seed_base	control	experimental	experimental_type	notes
+lig1	inputs/lig1.pdb	0	LIG		1,2,3	20261101	0	NA	NA	example protein ligand

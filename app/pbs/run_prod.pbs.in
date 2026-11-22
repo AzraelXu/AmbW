@@ -1,0 +1,108 @@
+#!/bin/bash
+# =============================================================================
+# 生产链：05_prod_c01 -> 05_prod_c02 -> ...（严格顺序）
+#
+# 续跑规则同 run_equil：已完成 chunk 跳过；未完成 chunk 及其下游重算。
+# 最后一个 chunk -> prod_final.rst7。
+# =============================================================================
+#PBS -N {{JOB_NAME}}
+#PBS -q {{QUEUE}}
+#PBS -l nodes={{NODES}}:ppn={{PPN}}:gpus={{GPUS}}
+#PBS -l walltime={{WALLTIME}}
+#PBS -j {{JOIN}}
+#PBS -o {{LOG_DIR}}
+#PBS -m {{MAIL}}
+
+set -o pipefail
+
+# 本集群 Torque 未把 #PBS -o 的输出写回 NFS；作业自身再落一份日志到 LOG_DIR。
+exec >>"{{LOG_DIR}}{{JOB_NAME}}.o${PBS_JOBID%%.*}" 2>&1
+
+cd "$PBS_O_WORKDIR" || { echo "无法进入 PBS_O_WORKDIR=$PBS_O_WORKDIR"; exit 1; }
+# 清除继承的 OpenMPI 库路径，避免与 {{AMBER_SH}} 的 OpenMPI 版本混用；
+# 混用不同 libmpi 会让 mpirun/sander.MPI 挂起。
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+  LD_LIBRARY_PATH=$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' \
+    | grep -v -i 'openmpi' | paste -sd: - || true)
+  export LD_LIBRARY_PATH
+fi
+# amber.sh 会读取 LD_LIBRARY_PATH/PERL5LIB/PYTHONPATH；这些变量在 qsub 环境中
+# 可能未导出，set -u 会让 source 直接退出。source 期间临时关闭 nounset。
+set +u
+source "{{AMBER_SH}}" || { echo "source {{AMBER_SH}} 失败"; exit 1; }
+set -u
+
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && [ -n "${PBS_GPUFILE:-}" ] && [ -f "$PBS_GPUFILE" ]; then
+  export CUDA_VISIBLE_DEVICES=$(sed -E 's/.*[^0-9]([0-9]+)$/\1/' "$PBS_GPUFILE" | paste -sd, -)
+fi
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU_ID:-0}}"
+# 单个 pmemd.cuda 只用一张 GPU；若 Torque 分配了多张，取第一张。
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}"
+
+echo "HOST=$(hostname) DIR=$PBS_O_WORKDIR JOB=$PBS_JOBID"
+echo "PBS_GPUFILE=${PBS_GPUFILE:-} CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+nvidia-smi -L 2>&1 | head -4 || true
+
+TOP="{{TOP}}"
+PROD_STEMS="{{PROD_STEMS}}"
+LAST_PROD="{{LAST_PROD}}"
+
+[ -s "$TOP" ] || { echo "缺少拓扑 $TOP"; exit 1; }
+[ -s npt.rst7 ] || { echo "缺少 npt.rst7；先完成 run_equil"; exit 1; }
+
+exec 9>.run_prod.lock
+if command -v flock >/dev/null 2>&1; then
+  flock -n 9 || { echo "另一个作业已持有 .run_prod.lock"; exit 1; }
+fi
+
+stage_done() {
+  local s=$1
+  [ -s "$s.rst7" ] || return 1
+  [ -s "$s.out" ] || return 1
+  grep -q 'Total wall time' "$s.out" || return 1
+  local nstlim nstep
+  nstlim=$(sed -n 's/.*nstlim[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$s.in" 2>/dev/null | tail -1)
+  if [ -n "$nstlim" ]; then
+    nstep=$(tail -n 2000 "$s.out" 2>/dev/null | \
+            sed -n 's/.*NSTEP[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' | tail -1)
+    [ -n "$nstep" ] && [ "$nstep" -ge "$nstlim" ] || return 1
+  fi
+  return 0
+}
+
+run_chunk() {
+  local s=$1 prev=$2
+  echo "=== RUN $s (prev=$prev) $(date) ==="
+  rm -f "$s.rst7" "$s.out" "$s.nc" "$s.mdinfo" "$s.log"
+  pmemd.cuda -O \
+    -i "$s.in" -o "$s.out" -p "$TOP" \
+    -c "$prev" -r "$s.rst7" -x "$s.nc" \
+    -inf "$s.mdinfo" -l "$s.log"
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "FAILED $s rc=$rc"
+    return "$rc"
+  fi
+  grep -E 'ns/day|Performance' "$s.mdinfo" 2>/dev/null | tail -2 || true
+  return 0
+}
+
+force=0
+prev=npt.rst7
+for s in $PROD_STEMS; do
+  if [ "$force" -eq 1 ]; then
+    rm -f "$s.rst7" "$s.out" "$s.nc" "$s.mdinfo" "$s.log"
+  fi
+  if stage_done "$s"; then
+    echo "SKIP $s (已完成)"
+    prev="$s.rst7"
+    continue
+  fi
+  force=1
+  run_chunk "$s" "$prev" || exit 1
+  prev="$s.rst7"
+done
+
+cp -f "$LAST_PROD.rst7" prod_final.rst7
+echo "=== PROD DONE $(date) -> prod_final.rst7 ==="

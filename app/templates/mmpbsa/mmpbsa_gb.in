@@ -1,0 +1,10 @@
+MM/GBSA, single trajectory
+&general
+  startframe={{START}}, endframe={{END}}, interval={{INTERVAL}},
+  verbose=1, keep_files={{KEEP_FILES}},
+{{MASKS}}
+/
+&gb
+  igb={{IGB}}, saltcon={{SALTCON}},
+/
+{{DECOMP}}

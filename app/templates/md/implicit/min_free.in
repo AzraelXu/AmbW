@@ -1,0 +1,10 @@
+GB minimization 2: unrestrained
+&cntrl
+  imin=1, maxcyc={{MIN_MAXCYC}}, ncyc={{MIN_NCYC}},
+  ntb=0, cut=999.0,
+  igb={{IGB}}, saltcon={{SALTCON}}, rgbmax={{RGBMAX}},
+  ntf=1, ntc=1,
+  ntr=0,
+  ntpr={{NTPR}}, ntwx=0, ntwr={{NTWR}},
+  ioutfm=1,
+/

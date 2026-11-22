@@ -1,0 +1,13 @@
+Short GB benchmark ({{BENCH_NS}} ns), same settings as production, no trajectory
+&cntrl
+  imin=0, irest=1, ntx=5,
+  nstlim={{BENCH_NSTLIM}}, dt={{DT}},
+  ntb=0, ntp=0,
+  igb={{IGB}}, saltcon={{SALTCON}}, rgbmax={{RGBMAX}},
+  ntt=3, gamma_ln={{GAMMA}}, temp0={{TEMP}},
+  ig={{SEED}},
+  ntc=2, ntf=2, cut=999.0,
+  ntr=0,
+  ntpr={{NTPR}}, ntwx=0, ntwr={{NTWR}},
+  ioutfm=1,
+/

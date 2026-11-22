@@ -1,0 +1,5 @@
+amber_general_workflow shared install
+created: 2026-10-31
+source: /home/user1/amber_general_workflow
+amber: /opt/software/amber22
+envs: envs/qc (parmed), envs/analysis (MDAnalysis/scipy/RDKit/netCDF4)

@@ -1,0 +1,21 @@
+# systems.tsv —— 每个配体（或每个质子化状态）一行
+#
+# 列（制表符分隔，不要用空格）：
+#   label             体系标签，用于 systems/<label>、md/<label>/r<rep>、分析文件名
+#   ligand_pdb        配体 PDB（必须含显式氢；单残基）；apo 体系填 -
+#   charge            配体净电荷（整数，必须手填）；apo 填 -
+#   resname           配体残基名（1-4 字符）；apo 填 -
+#   models            逗号分隔的 NMR 模型号；空 = 单模型；与 replicas 按顺序对应
+#   replicas          逗号分隔的副本号；空 = 1
+#   seed_base         该体系 r1 的随机种子；rN = seed_base + (N-1)
+#   control           1 = 对照体系（参与排名表，但不参与与实验值的相关/置换统计）
+#   experimental      实验值（IC50/Kd 的 µM，或 ΔG 的 kcal/mol）；无则 NA
+#   experimental_type ic50 | kd | dg | NA
+#   notes             备注（可含空格；不要含制表符）
+#
+# 示例：3 个配体 × 3 个 NMR 模型副本
+label	ligand_pdb	charge	resname	models	replicas	seed_base	control	experimental	experimental_type	notes
+lig1	inputs/lig1.pdb	2	LIG	7,11,10	1,2,3	20261101	0	7.9	ic50	A1AZM
+lig2	inputs/lig2.pdb	3	LIG	5,16,1	1,2,3	20261201	0	18.9	ic50	A1AZL
+lig3	inputs/lig3.pdb	1	LIG	15,14,9	1,2,3	20261301	0	100.4	ic50	MQC +1
+lig3_p2	inputs/lig3_p2.pdb	2	LIG	15,14,9	1,2,3	20261401	1	NA	NA	MQC +2 control

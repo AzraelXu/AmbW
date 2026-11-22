@@ -1,0 +1,8 @@
+parm {{TOP}}
+{{TRAJIN}}
+{{AUTOIMAGE}}
+{{STRIP}}
+{{RMS}}
+trajout {{DRY_NC}} netcdf
+run
+quit

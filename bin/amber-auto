@@ -1,0 +1,8 @@
+#!/bin/bash
+# Shared entry point for amber_general_workflow.
+# Users may export AMBER_AUTO_CONFIG=/path/to/your-auto.json to override the
+# site configuration; command-line --config still takes precedence.
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+: "${AMBER_AUTO_CONFIG:=$HERE/config/auto.site.json}"
+export AMBER_AUTO_CONFIG
+exec "$HERE/envs/analysis/bin/python" "$HERE/app/bin/amber-auto" "$@"

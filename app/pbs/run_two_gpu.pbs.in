@@ -1,0 +1,70 @@
+#!/bin/bash
+# =============================================================================
+# 整节点双副本 fallback：一个节点 2×RTX3090，每个 GPU 跑一个副本的同一 stage。
+# 注意：这不是"申请 2 个 GPU 的 8 核作业"，而是整节点 ppn=48；不要写成
+#       #PBS -l nodes=1:ppn=8:gpus=2
+# =============================================================================
+#PBS -N {{JOB_NAME}}
+#PBS -q {{QUEUE}}
+#PBS -l nodes={{NODES}}:ppn={{PPN}}
+#PBS -l walltime={{WALLTIME}}
+#PBS -j {{JOIN}}
+#PBS -o {{LOG_DIR}}
+#PBS -m {{MAIL}}
+
+set -o pipefail
+
+# 本集群 Torque 未把 #PBS -o 的输出写回 NFS；作业自身再落一份日志到 LOG_DIR。
+exec >>"{{LOG_DIR}}{{JOB_NAME}}.o${PBS_JOBID%%.*}" 2>&1
+
+cd "$PBS_O_WORKDIR" || { echo "无法进入 PBS_O_WORKDIR=$PBS_O_WORKDIR"; exit 1; }
+# 清除继承的 OpenMPI 库路径，避免与 {{AMBER_SH}} 的 OpenMPI 版本混用；
+# 混用不同 libmpi 会让 mpirun/sander.MPI 挂起。
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+  LD_LIBRARY_PATH=$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' \
+    | grep -v -i 'openmpi' | paste -sd: - || true)
+  export LD_LIBRARY_PATH
+fi
+# amber.sh 会读取 LD_LIBRARY_PATH/PERL5LIB/PYTHONPATH；这些变量在 qsub 环境中
+# 可能未导出，set -u 会让 source 直接退出。source 期间临时关闭 nounset。
+set +u
+source "{{AMBER_SH}}" || { echo "source {{AMBER_SH}} 失败"; exit 1; }
+set -u
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+REP1_DIR="{{REP1_DIR}}"
+REP2_DIR="{{REP2_DIR}}"
+STAGE="{{STAGE}}"
+PREV="{{PREV}}"
+TOP="{{TOP}}"
+REF="{{REF}}"
+
+[ -d "$REP1_DIR" ] || { echo "副本目录不存在: $REP1_DIR"; exit 1; }
+[ -d "$REP2_DIR" ] || { echo "副本目录不存在: $REP2_DIR"; exit 1; }
+[ "$REP1_DIR" != "$REP2_DIR" ] || { echo "两个副本目录相同"; exit 1; }
+[ -s "$REP1_DIR/$TOP" ] || { echo "缺少 $REP1_DIR/$TOP"; exit 1; }
+[ -s "$REP2_DIR/$TOP" ] || { echo "缺少 $REP2_DIR/$TOP"; exit 1; }
+[ -s "$REP1_DIR/$PREV" ] || { echo "缺少 $REP1_DIR/$PREV"; exit 1; }
+[ -s "$REP2_DIR/$PREV" ] || { echo "缺少 $REP2_DIR/$PREV"; exit 1; }
+
+echo "HOST=$(hostname) JOB=$PBS_JOBID"
+nvidia-smi -L 2>&1 | head -4 || true
+
+run_one() {
+  local dir="$1" gpu="$2"
+  cd "$dir" || return 1
+  echo "=== GPU $gpu $dir $STAGE $(date) ==="
+  CUDA_VISIBLE_DEVICES="$gpu" pmemd.cuda -O \
+    -i "$STAGE.in" -o "$STAGE.out" -p "$TOP" \
+    -c "$PREV" -ref "$REF" -r "$STAGE.rst7" -x "$STAGE.nc" \
+    -inf "$STAGE.mdinfo" -l "$STAGE.log"
+}
+
+run_one "$REP1_DIR" 0 &
+p1=$!
+run_one "$REP2_DIR" 1 &
+p2=$!
+wait "$p1"; s1=$?
+wait "$p2"; s2=$?
+echo "exit statuses: replica1=$s1 replica2=$s2"
+exit $(( s1 || s2 ))

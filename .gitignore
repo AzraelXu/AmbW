@@ -1,0 +1,19 @@
+# 安装环境（不纳入版本控制）
+envs/
+
+# 运行输出 / 日志
+amber-campaign/
+logs/
+*.log
+*.o[0-9]*
+*.e[0-9]*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 编辑器 / 操作系统
+.DS_Store
+.idea/
+.vscode/

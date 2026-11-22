@@ -1,0 +1,7 @@
+#!/bin/bash
+# Shared entry point for the legacy amber-kit workflow.
+# The project-local copy created by `amber-kit init` does not need this wrapper;
+# its config.sh already points at the shared environments.
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+export PYTHON_RENDER="${PYTHON_RENDER:-$HERE/envs/analysis/bin/python}"
+exec "$HERE/app/bin/amber-kit" "$@"
