@@ -1,0 +1,127 @@
+#!/bin/bash
+# =============================================================================
+# EXPERIMENTAL: GPU minimization variant. pmemd.cuda minimization diverged
+# (BOND energy blow-up) on the 86,964-atom example; validate before use.
+# 平衡链：01_min_restraint -> 02_min_free -> 03_heat -> 04a..04j
+#
+# 断点续跑规则：
+#   - 一个 stage 完成 = .rst7 存在 + .out 含 "Total wall time" + NSTEP >= nstlim
+#   - 已完成的 stage 不重算、不覆盖
+#   - 某个 stage 未完成 -> 它和所有下游都重算（避免旧 c03 基于旧 c02）
+#   - flock 防止同一副本并发
+# =============================================================================
+#PBS -N {{JOB_NAME}}
+#PBS -q {{QUEUE}}
+#PBS -l nodes={{NODES}}:ppn={{PPN}}:gpus={{GPUS}}
+#PBS -l walltime={{WALLTIME}}
+#PBS -j {{JOIN}}
+#PBS -o {{LOG_DIR}}
+#PBS -m {{MAIL}}
+
+set -o pipefail
+
+# 本集群 Torque 未把 #PBS -o 的输出写回 NFS；作业自身再落一份日志到 LOG_DIR。
+exec >>"{{LOG_DIR}}{{JOB_NAME}}.o${PBS_JOBID%%.*}" 2>&1
+export SCH_COLOR=never
+
+cd "$PBS_O_WORKDIR" || { echo "无法进入 PBS_O_WORKDIR=$PBS_O_WORKDIR"; exit 1; }
+# 清除继承的 OpenMPI 库路径，避免与 {{AMBER_SH}} 的 OpenMPI 版本混用；
+# 混用不同 libmpi 会让 mpirun/sander.MPI 挂起。
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+  LD_LIBRARY_PATH=$(printf '%s' "$LD_LIBRARY_PATH" | tr ':' '\n' \
+    | grep -v -i 'openmpi' | paste -sd: - || true)
+  export LD_LIBRARY_PATH
+fi
+# amber.sh 会读取 LD_LIBRARY_PATH/PERL5LIB/PYTHONPATH；这些变量在 qsub 环境中
+# 可能未导出，set -u 会让 source 直接退出。source 期间临时关闭 nounset。
+set +u
+source "{{AMBER_SH}}" || { echo "source {{AMBER_SH}} 失败"; exit 1; }
+set -u
+
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && [ -n "${PBS_GPUFILE:-}" ] && [ -f "$PBS_GPUFILE" ]; then
+  export CUDA_VISIBLE_DEVICES=$(sed -E 's/.*[^0-9]([0-9]+)$/\1/' "$PBS_GPUFILE" | paste -sd, -)
+fi
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU_ID:-0}}"
+# 单个 pmemd.cuda 只用一张 GPU；若 Torque 分配了多张，取第一张。
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}"
+
+echo "HOST=$(hostname) DIR=$PBS_O_WORKDIR JOB=$PBS_JOBID"
+echo "PBS_GPUFILE=${PBS_GPUFILE:-} CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+nvidia-smi -L 2>&1 | head -4 || true
+
+TOP="{{TOP}}"
+CRD="{{CRD}}"
+MIN1="{{MIN1}}"
+MIN2="{{MIN2}}"
+HEAT="{{HEAT}}"
+RELEASE_STEMS="{{RELEASE_STEMS}}"
+LAST_RELEASE="{{LAST_RELEASE}}"
+
+[ -s "$TOP" ] || { echo "缺少拓扑 $TOP"; exit 1; }
+[ -s "$CRD" ] || { echo "缺少坐标 $CRD"; exit 1; }
+
+# 并发锁：同一副本目录只允许一个作业
+exec 9>.run_equil.lock
+if command -v flock >/dev/null 2>&1; then
+  flock -n 9 || { echo "另一个作业已持有 .run_equil.lock"; exit 1; }
+fi
+
+stage_done() {
+  local s=$1
+  [ -s "$s.rst7" ] || return 1
+  [ -s "$s.out" ] || return 1
+  grep -q 'Total wall time' "$s.out" || return 1
+  local nstlim nstep
+  nstlim=$(sed -n 's/.*nstlim[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$s.in" 2>/dev/null | tail -1)
+  if [ -n "$nstlim" ]; then
+    nstep=$(tail -n 2000 "$s.out" 2>/dev/null | \
+            sed -n 's/.*NSTEP[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' | tail -1)
+    [ -n "$nstep" ] && [ "$nstep" -ge "$nstlim" ] || return 1
+  fi
+  return 0
+}
+
+run_stage() {
+  local s=$1 prev=$2
+  echo "=== RUN $s (prev=$prev) $(date) ==="
+  # 只清当前未完成 stage；不动已完成的 stage
+  rm -f "$s.rst7" "$s.out" "$s.nc" "$s.mdinfo" "$s.log"
+  if [[ "$s" == 01_* || "$s" == 02_* ]]; then
+    # GPU minimization: pmemd.cuda supports imin=1; ntwx=0 so no -x.
+    pmemd.cuda -O \
+      -i "$s.in" -o "$s.out" -p "$TOP" \
+      -c "$prev" -ref "$CRD" -r "$s.rst7" \
+      -inf "$s.mdinfo" -l "$s.log"
+  else
+    pmemd.cuda -O \
+      -i "$s.in" -o "$s.out" -p "$TOP" \
+      -c "$prev" -ref "$CRD" -r "$s.rst7" -x "$s.nc" \
+      -inf "$s.mdinfo" -l "$s.log"
+  fi
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "FAILED $s rc=$rc; 保留现场，重投会从这个 stage 之前的 restart 继续"
+    return "$rc"
+  fi
+  return 0
+}
+
+force=0
+prev="$CRD"
+for s in "$MIN1" "$MIN2" "$HEAT" $RELEASE_STEMS; do
+  if [ "$force" -eq 1 ]; then
+    rm -f "$s.rst7" "$s.out" "$s.nc" "$s.mdinfo" "$s.log"
+  fi
+  if stage_done "$s"; then
+    echo "SKIP $s (已完成)"
+    prev="$s.rst7"
+    continue
+  fi
+  force=1
+  run_stage "$s" "$prev" || exit 1
+  prev="$s.rst7"
+done
+
+cp -f "$LAST_RELEASE.rst7" npt.rst7
+echo "=== EQUIL DONE $(date) -> npt.rst7 ==="

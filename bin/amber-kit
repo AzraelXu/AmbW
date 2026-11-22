@@ -2,6 +2,44 @@
 # Shared entry point for the legacy amber-kit workflow.
 # The project-local copy created by `amber-kit init` does not need this wrapper;
 # its config.sh already points at the shared environments.
+# PYTHON_RENDER selects the interpreter (command name or absolute path).
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
-export PYTHON_RENDER="${PYTHON_RENDER:-$HERE/envs/analysis/bin/python}"
+
+UI_LIB="$HERE/app/scripts/lib/ui.sh"
+HAVE_UI=0
+if [ -f "$UI_LIB" ]; then
+  HAVE_UI=1
+  export UI_CMD_PREFIXES="${UI_CMD_PREFIXES:-amber-}"
+  # shellcheck source=app/scripts/lib/ui.sh
+  source "$UI_LIB"
+  ui_parse_color_args "$@" || exit $?
+  set -- "${UI_ARGS[@]+"${UI_ARGS[@]}"}"
+fi
+
+resolve_python() {
+  local cand
+  if [ -n "${PYTHON_RENDER:-}" ]; then
+    command -v "$PYTHON_RENDER" 2>/dev/null && return 0
+    return 1
+  fi
+  for cand in "$HERE/envs/analysis/bin/python" \
+              "/opt/software/amber_general_workflow/envs/analysis/bin/python"; do
+    if [ -x "$cand" ]; then
+      command -v "$cand"
+      return 0
+    fi
+  done
+  command -v python3 2>/dev/null && return 0
+  return 1
+}
+
+PYTHON=$(resolve_python) || {
+  if [ "$HAVE_UI" -eq 1 ]; then
+    error "no usable Python found; set PYTHON_RENDER=/path/to/python"
+  else
+    echo "error: no usable Python found; set PYTHON_RENDER=/path/to/python" >&2
+  fi
+  exit 2
+}
+export PYTHON_RENDER="$PYTHON"
 exec "$HERE/app/bin/amber-kit" "$@"
