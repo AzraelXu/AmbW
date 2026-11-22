@@ -203,12 +203,48 @@ tail -n 50 "$CAMP"/complexes/*/logs/*.o* 2>/dev/null
 | `--param-nodes` | 参数化 PBS 作业节点 | 默认跟 `pbs_nodes`；站点设为 `1` 让调度器挑空闲节点 |
 | `--equil-walltime` | 平衡作业 walltime | 大体系建议 `48:00:00`；被 walltime 杀掉后 `resume` 会跳过已完成的 min/stage |
 | `--min-engine` | 最小化引擎 `sander` / `pmemd.cuda` | 默认 `sander`；`pmemd.cuda` 为实验选项，本示例大体系实测 BOND 发散，不建议直接用 |
+| `--hmr` / `--no-hmr` | 开启/关闭 HMR | 用 `--hmr --dt 0.004 --traj-interval-ps 200`；见 §6.1 |
+| `--hmr-mass` | 非水氢目标质量 | 默认 3.024 Da；一般不要改 |
 | `--mmpbsa-interval` | MM/GBSA 取帧间隔 | 10 ns 轨迹建议 20（后 50% 约 25 帧） |
 | `--no-mmpbsa` | 关闭 MM/GBSA | 只做结构分析时用 |
 | `--no-submit` / `--dry-run` | 不提交 | 先检查再提交 |
 | `--force` | 重建指定体系 | 会清该体系产物，不动其他体系 |
 
 注意：`--pbs-nodes`、`--mmpbsa-interval` 等参数在**建系时**写进渲染后的 PBS；事后改参数需要重建（或新建 campaign）。`resume` 不会改变已渲染脚本。
+
+### 6.1 HMR + 4 fs + 200 ps/帧（可选）
+
+HMR（hydrogen mass repartitioning）把**非水氢**质量调到 3.024 Da，重原子补回差值，总质量不变；水氢保持 1.008（OPC/TIP3P/TIP4P 的 SETTLE）。配合 `dt=0.004 ps` 和 SHAKE（模板已 `ntc=2/ntf=2`），在保持物理时长不变的前提下把步数减半；200 ps/帧把 300 ns 生产轨迹从 30,000 帧降到 1,500 帧。
+
+```bash
+./bin/amber-auto run "$WT" --campaign "$CAMP" --ligand 01:L:1 --charge 1 \
+  --hmr --dt 0.004 --traj-interval-ps 200 \
+  --prod-ns 300 --prod-chunks 12 \
+  --mmpbsa-interval 5 \
+  --pbs-nodes node02 --param-pbs --param-ppn 40 \
+  --param-amber-sh /home/user1/Software/anaconda3/envs/ambertools_env/amber.sh \
+  --param-nodes 1 --min-engine sander
+```
+
+**注意**：
+- `nstlim` 会按 `ns×1000/dt` 自动减半（2 fs 的 25 ns chunk 是 12,500,000；4 fs 是 6,250,000），不要手工改 `.in`；
+- 300 ns = 1,500 帧；`--mmpbsa-interval 5` 在后 50% 窗口给出 150 帧（与 10 ps/帧、interval 100 的统计量一致）；
+- 建系产物：`systems/<label>/complex_hmr.prmtop`、`complex.prmtop.orig`、`hmr_manifest.json`；`build_manifest.json` 的 `hmr` 和 `run_config.json` 的 `hmr` 可用于核对；`complex.prmtop` 已替换为 HMR，后续 equil/prod/post 自动使用；
+- 先看 `hmr_manifest.json` 的 `hydrogens_solute`、`hydrogens_water`、`total_mass_before/after`、`water_h_mass_*`；
+- 正式 heat 从 min2 restart 启动；**不要**从未最小化的 `complex.inpcrd` 直接跑 4 fs/HMR。
+
+**什么时候不能用 `--hmr`**：
+
+1. `--render-only`：没有真实拓扑，直接报错；
+2. 体系没有非水氢（如只有水/离子）：HMR 是 no-op，4 fs 没有依据；
+3. 氘代/氢化物/自由质子/H₂ 等 H 不接在重原子上的体系：ParmEd 的 HMR 假设 H 与重原子成键，未验证/不适用；
+4. 拓扑已经是 HMR 且没有 `complex.prmtop.orig` 备份：无法恢复原始质量，需 `--force` 重建；
+5. `--hmr-mass ≤ 1.008` 或过大导致重原子质量 ≤ 0：脚本会拒绝（默认 3.024 即可）；
+6. 没有 parmed 的 `py_qc`：建系直接报错；
+7. `dt > 0.004 ps` 或 `ntc=1/ntf=1`（无 SHAKE）：未验证，HMR 的前提是 SHAKE + 4 fs；
+8. 未最小化/未平衡的起点直接 4 fs：会 NaN，必须走 min/heat；
+9. QM/MM、非 Amber 引擎、或依赖 H 质量的动力学量（速度自相关、扩散、转动相关、振动谱、H 动能）：HMR 会改变 H 质量，结构/热力学量通常可用，但这些动力学量不要直接与非 HMR 对比；
+10. 已有 campaign 是 2 fs/非 HMR 建的：`resume` 不会补 HMR，需 `--force` 重建（或新建 campaign）。
 
 ## 7. 结果查看与正确性校验
 
@@ -264,6 +300,8 @@ column -t -s $'\t' "$CAMP"/complexes/<label>/analysis/mmpbsa/<label>_r1/summary.
 
 MM/GBSA 的 `frames` 应与预期一致（10 ns、10 ps 间隔、后 50% 窗口、`interval=20` → 约 25 帧）。帧数过少时工具会警告，必要时减小 `--mmpbsa-interval` 并重建。
 
+HMR + 200 ps/帧时，300 ns → 1,500 帧；后 50% 窗口 750 帧，`--mmpbsa-interval 5` → 150 帧（与 10 ps/帧、interval 100 的统计量一致）。
+
 ### 7.5 输入未被修改
 
 ```bash
@@ -300,6 +338,11 @@ sha256sum "$DATA"/*.pdb
 | 同一 campaign 再 `run` 报 duplicate | 输入 SHA 已存在 | 用 `resume`；新建 campaign；或 `--force` |
 | wrapper 报找不到 Python | 源码 checkout 无 `envs/` | 设 `AMBER_AUTO_PYTHON`，或使用共享安装入口 |
 | MM/GBSA 帧数很少 | 默认 `interval=100` + 后 50% 窗口 | 用 `--mmpbsa-interval 20` 或更小，重建 post PBS |
+| `--hmr` 报 `requires a real build` | 与 `--render-only` 同用 | 去掉 `--render-only` |
+| `--hmr` 报 `no non-water hydrogens` | 体系没有溶质氢 | HMR 无效；不要用 4 fs |
+| `--hmr` 报 `already looks like HMR` | 拓扑已 HMR 且缺 `.orig` | `--force` 重建或恢复原拓扑 |
+| `--hmr` 报 `non-positive mass` | `--hmr-mass` 过大 | 用默认 3.024 Da |
+| 4 fs 启动 `TEMP/EKtot=NaN` | 从未最小化结构直接跑 | 从 min2/heat 起点 |
 
 更多错误码见 [app/docs/ERRORS.md](app/docs/ERRORS.md)，系统排错见 [app/docs/TROUBLESHOOTING.md](app/docs/TROUBLESHOOTING.md)。
 
@@ -325,6 +368,9 @@ A：自动分类把两条蛋白链都视为受体（蛋白–蛋白/多链模式
 
 **Q：MM/GBSA 能当 Kd 用吗？**
 A：不能。它不含熵，是相对指标；不要跨靶点排名，也不要用它替代实验亲和力。
+
+**Q：`--hmr` 什么时候不能用？**
+A：`--render-only`、无溶质氢、氘代/氢化物/自由质子/H₂、已 HMR 且无 `.orig` 备份、`--hmr-mass` 非法、无 parmed、`dt > 0.004` 或 `ntc=1`、未最小化起点、QM/MM/非 Amber 引擎、依赖 H 质量的动力学量；已有非 HMR campaign 需要 `--force` 重建。详见 §6.1。
 
 **Q：可以只做建系不做 MD 吗？**
 A：可以，`run ... --no-submit` 或 `build ...`；后者只建系不渲染提交计划。

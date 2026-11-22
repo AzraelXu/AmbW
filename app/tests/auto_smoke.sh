@@ -22,7 +22,8 @@ bad() { FAIL=$((FAIL+1)); echo "FAIL $*"; }
 # 1. syntax / compile -------------------------------------------------------
 if python3 -m py_compile bin/amber-auto scripts/inspect_complex.py \
     scripts/prepare_complex.py scripts/ligand_charge.py \
-    scripts/partner_selection.py scripts/verify_linkage.py; then
+    scripts/partner_selection.py scripts/verify_linkage.py \
+    scripts/hmr_topology.py; then
   ok "py_compile amber-auto helpers"
 else
   bad "py_compile amber-auto helpers"
@@ -111,14 +112,19 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
 else
   if ./bin/amber-auto build tests/data/auto_pl.pdb --campaign "$TMP/camp" \
       --force --prod-ns 0.1 --prod-chunks 1 --pad 8 \
+      --hmr --dt 0.004 --traj-interval-ps 200 --mmpbsa-interval 5 \
       >"$TMP/build.out" 2>"$TMP/build.err"; then
     C="$TMP/camp/complexes/auto_pl"
     if [ -s "$C/systems/auto_pl/complex.prmtop" ] \
+       && [ -s "$C/systems/auto_pl/complex_hmr.prmtop" ] \
+       && [ -s "$C/systems/auto_pl/complex.prmtop.orig" ] \
        && grep -q "LIGAND_MASK=':3'" "$C/systems/auto_pl/masks.env" \
-       && python3 -c "import json; d=json.load(open('$C/md/auto_pl/r1/run_config.json')); raise SystemExit(0 if len(d['production']['files'])==1 else 1)"; then
-      ok "amber-auto build (protein-ligand)"
+       && python3 -c "import json; d=json.load(open('$C/md/auto_pl/r1/run_config.json')); raise SystemExit(0 if len(d['production']['files'])==1 and d['hmr']['enabled'] and abs(d['dt_ps']-0.004)<1e-12 and abs(d['trajectory_interval_ps']-200)<1e-12 else 1)" \
+       && grep -q -- '--frame-ps "200' "$C/md/auto_pl/r1/run_post.pbs" \
+       && grep -q -- '--interval "5"' "$C/md/auto_pl/r1/run_post.pbs"; then
+      ok "amber-auto build (protein-ligand, HMR)"
     else
-      bad "amber-auto build artifacts"
+      bad "amber-auto build artifacts (HMR)"
     fi
     if [ -s "$C/md/auto_pl/r1/run_post.pbs" ] \
        && bash -n "$C/md/auto_pl/r1/run_post.pbs"; then

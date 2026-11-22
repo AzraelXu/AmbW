@@ -36,6 +36,7 @@ logs/                          # 旧流程日志占位
 
 - `amber-auto`：复合物 PDB → 分类/准备/配体参数化/tleap+QC/masks/MD 输入 → `equil → prod → post` Torque 依赖链 → cpptraj/分析/MM-GBSA。
 - `amber-kit`：项目式旧流程，支持 RNA–配体、NMR 多模型、已有项目与精细控制。
+- 可选 HMR（`--hmr` / `HMR=1`）：非水氢 3.024 Da，水氢不变；配合 4 fs + SHAKE；`--render-only` 不适用。适用/禁用条件见 [../TUTORIAL.md](../TUTORIAL.md) §6.1。
 
 ## 科学判断警告
 

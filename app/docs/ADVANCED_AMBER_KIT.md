@@ -27,6 +27,8 @@ bin/amber-kit mmpbsa  --label lig1 --rep 1 --force
 bin/amber-kit report
 ```
 
+HMR（可选）：`config.sh` 设 `HMR=1; HMR_MASS=3.024`，并把 `DT=0.004`、`TRAJ_INTERVAL_PS=200`；`build` 会生成 `complex_hmr.prmtop` / `complex.prmtop.orig`，`inputs` 把 `hmr` 写入 `run_config.json`。`--render-only` 与 HMR 互斥。适用/禁用条件见根 [`../TUTORIAL.md`](../TUTORIAL.md) §6.1。
+
 完整教程：[`../TUTORIAL.md`](../TUTORIAL.md)。PBS 细节：[`../pbs/README.md`](../pbs/README.md)。
 
 ## 与 amber-auto 的关系

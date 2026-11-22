@@ -111,6 +111,8 @@ DEFAULTS = {
     "prod_chunks": 4,
     "dt": 0.002,
     "traj_interval_ps": 10.0,
+    "hmr": False,
+    "hmr_mass": 3.024,
     "replicas": 1,
     "seed_base": 20261001,
     "strip_mask": ":WAT,Na+,Cl-,K+",
@@ -232,7 +234,8 @@ def load_config(args):
         "radii": "radii", "igb": "igb", "heat_ns": "heat_ns",
         "release_stages": "release_stages", "release_ns": "release_ns",
         "prod_ns": "prod_ns", "prod_chunks": "prod_chunks", "dt": "dt",
-        "traj_interval_ps": "traj_interval_ps", "replicas": "replicas",
+        "traj_interval_ps": "traj_interval_ps",
+        "hmr_mass": "hmr_mass", "replicas": "replicas",
         "seed_base": "seed_base", "pbs_queue": "pbs_queue",
         "pbs_nodes": "pbs_nodes", "ppn": "ppn",
         "param_ppn": "param_ppn", "param_walltime": "param_walltime",
@@ -254,6 +257,8 @@ def load_config(args):
         cfg["mmpbsa"] = False
     if getattr(args, "no_reduce", False):
         cfg["no_reduce"] = True
+    if getattr(args, "hmr", None) is not None:
+        cfg["hmr"] = bool(args.hmr)
     if getattr(args, "param_pbs", None) is not None:
         cfg["param_pbs"] = args.param_pbs
     if getattr(args, "mmpbsa_igb", None) is not None:
@@ -277,6 +282,16 @@ def validate_config(cfg):
         die("--heat-ns must be > 0")
     if float(cfg["dt"]) <= 0:
         die("--dt must be > 0")
+    if cfg.get("hmr"):
+        try:
+            hmr_mass = float(cfg["hmr_mass"])
+        except (TypeError, ValueError):
+            die("hmr_mass must be a number")
+        if hmr_mass <= 1.008:
+            die("--hmr-mass must be > 1.008 Da")
+        if float(cfg["dt"]) > 0.004 + 1e-12:
+            warn("--hmr with --dt > 0.004 ps is not validated; "
+                 "0.004 ps is the tested maximum")
     if float(cfg["pad"]) <= 0:
         die("--pad must be > 0")
     if int(cfg["param_ppn"]) < 1:
@@ -597,6 +612,8 @@ def build_system(manifest, cdir, cfg, args):
               "--outdir", outdir, "--top-name", top_name,
               "--no-pdb4amber", "--extra-leap", prep["extra_leap"],
               "--force"]
+    if cfg.get("hmr"):
+        common += ["--hmr", "--hmr-mass", str(cfg["hmr_mass"])]
     if cfg["solvent"] == "explicit":
         common += ["--water", cfg["water"], "--box", cfg["box"],
                    "--pad", str(cfg["pad"])]
@@ -634,6 +651,13 @@ def build_system(manifest, cdir, cfg, args):
     inpcrd_path = os.path.join(outdir, f"{top_name}.inpcrd")
     if not os.path.isfile(top_path) or not os.path.isfile(inpcrd_path):
         raise BuildError(f"tleap did not produce {top_path}/{inpcrd_path}")
+    hmr = None
+    if cfg.get("hmr"):
+        hmr_path = os.path.join(outdir, "hmr_manifest.json")
+        if not os.path.isfile(hmr_path):
+            raise BuildError(f"HMR requested but no {hmr_path} was written")
+        with open(hmr_path, encoding="utf-8") as fh:
+            hmr = json.load(fh)
     return {
         "top_name": top_name,
         "prmtop": top_path,
@@ -641,6 +665,7 @@ def build_system(manifest, cdir, cfg, args):
         "outdir": outdir,
         "manifest": bman,
         "counterion": counterion,
+        "hmr": hmr,
     }
 
 
@@ -731,6 +756,8 @@ def write_compat(manifest, cdir, cfg, args):
         "PROD_CHUNK_NS": str(cfg["prod_ns"] / cfg["prod_chunks"]),
         "DT": str(cfg["dt"]),
         "TRAJ_INTERVAL_PS": str(cfg["traj_interval_ps"]),
+        "HMR": "1" if cfg.get("hmr") else "0",
+        "HMR_MASS": str(cfg.get("hmr_mass", 3.024)),
         "SEED_BASE": str(cfg["seed_base"]),
         "PBS_QUEUE": cfg["pbs_queue"],
         "PBS_NODES": str(cfg["pbs_nodes"]),
@@ -835,6 +862,8 @@ def setup_replicas(manifest, masks, cdir, cfg, args):
                "--dt", str(cfg["dt"]),
                "--traj-interval-ps", str(cfg["traj_interval_ps"]),
                "--force"]
+        if cfg.get("hmr"):
+            cmd += ["--hmr", "--hmr-mass", str(cfg["hmr_mass"])]
         if ligand:
             cmd += ["--ligand-resname", manifest["ligand"].get("resname", "LIG")]
         if cfg["solvent"] == "implicit":
@@ -1003,6 +1032,7 @@ def build_one(pdb, args, cfg, root, state):
                 "manifest": rel(build["manifest"], cdir),
                 "linkage": rel(linkage, cdir),
                 "counterion": build["counterion"],
+                "hmr": build.get("hmr"),
             },
             "masks": {
                 "restraint": masks.get("RESTRAINT_MASK", ""),
@@ -1645,6 +1675,13 @@ def add_build_options(p):
     p.add_argument("--prod-chunks", type=int, default=None)
     p.add_argument("--dt", type=float, default=None)
     p.add_argument("--traj-interval-ps", type=float, default=None)
+    p.add_argument("--hmr", dest="hmr", action="store_true", default=None,
+                   help="HMR: repartition non-water hydrogen masses "
+                        "(default: config; use with --dt 0.004)")
+    p.add_argument("--no-hmr", dest="hmr", action="store_false", default=None,
+                   help="disable HMR")
+    p.add_argument("--hmr-mass", type=float, default=None,
+                   help="new non-water hydrogen mass in Da (default 3.024)")
     p.add_argument("--pbs-queue", default=None)
     p.add_argument("--pbs-nodes", default=None,
                    help="Torque nodes spec (default 1); use a node name "

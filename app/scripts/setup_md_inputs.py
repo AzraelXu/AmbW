@@ -225,6 +225,11 @@ def main():
     ap.add_argument("--prod-chunk-ns", type=float, default=None)
 
     ap.add_argument("--dt", type=float, default=None)
+    ap.add_argument("--hmr", action="store_true",
+                    help="topology uses hydrogen mass repartitioning; "
+                         "recorded in run_config.json (does not alter the .in files)")
+    ap.add_argument("--hmr-mass", type=float, default=None,
+                    help="non-water hydrogen mass in Da (default 3.024)")
     ap.add_argument("--cut", type=float, default=None)
     ap.add_argument("--temp", type=float, default=None)
     ap.add_argument("--pres", type=float, default=None)
@@ -341,9 +346,16 @@ def main():
         die("--seed must be a positive integer")
     if args.dt <= 0:
         die("--dt must be positive")
+    hmr_mass = 3.024 if args.hmr_mass is None else args.hmr_mass
+    if args.hmr_mass is not None and args.hmr_mass <= 1.008:
+        die("--hmr-mass must be > 1.008 Da")
     if args.dt > 0.002:
-        warn(f"dt={args.dt} ps is larger than the SHAKE-safe 0.002 ps; "
-             "only use this with hydrogen mass repartitioning")
+        if args.hmr:
+            warn(f"dt={args.dt} ps with --hmr; confirm the prmtop really has "
+                 "repartitioned non-water hydrogen masses")
+        else:
+            warn(f"dt={args.dt} ps is larger than the SHAKE-safe 0.002 ps; "
+                 "pass --hmr and use an HMR topology (otherwise 4 fs is unsafe)")
     if args.heat_ns <= 0:
         die("--heat-ns must be > 0")
     if args.prod_chunks < 1:
@@ -641,6 +653,13 @@ Submit with the `cluster3-torque` skill; do not run on the login node.{engine_no
         "ntwx": ntwx,
         "ntpr": args.ntpr,
         "ntwr": args.ntwr,
+        "hmr": {
+            "enabled": bool(args.hmr),
+            "hydrogen_mass": hmr_mass if args.hmr else None,
+            "water_hydrogens_repartitioned": False,
+            "topology": (os.path.basename(args.prmtop)
+                         if args.hmr and args.prmtop else None),
+        },
         "files": list(files),
     }
     with open(os.path.join(args.out, "run_config.json"), "w", encoding="utf-8") as fh:

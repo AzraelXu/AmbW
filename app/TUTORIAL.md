@@ -71,6 +71,8 @@ PBS_GPUS=1                    # 单个 pmemd.cuda 只用 1 张
 PBS_GPUS_PER_NODE=4           # 本机每节点 4 张；其他集群改这里
 PBS_TWO_GPU_PPN=48            # 整节点 CPU 核数
 PBS_WALLTIME="24:00:00"
+
+HMR=0; HMR_MASS=3.024      # HMR=1 需要 DT=0.004，且从最小化起点跑
 ```
 
 ### 1.3 编辑 `config/systems.tsv`
@@ -405,6 +407,8 @@ README.md             手跑命令
 - `nstlim = ns × 1000 / dt`；`ntwx = traj_interval_ps / dt`；
 - 种子：`seed_base + (rep-1)`，每个 stage 再递增；记录在 `run_config.json`；
 - 生产 chunk 有状态，严格 c01→c04。
+
+HMR（可选）：`config.sh` 设 `HMR=1; HMR_MASS=3.024`，并把 `DT=0.004`、`TRAJ_INTERVAL_PS=200`；`build` 会生成 `complex_hmr.prmtop` / `complex.prmtop.orig`，`inputs` 把 `hmr` 写入 `run_config.json`。`--render-only` 与 HMR 互斥。适用/禁用条件同根 [`../TUTORIAL.md`](../TUTORIAL.md) §6.1。
 
 先检查：
 

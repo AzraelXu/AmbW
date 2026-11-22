@@ -21,6 +21,8 @@
   "prod_chunks": 4,
   "dt": 0.002,
   "traj_interval_ps": 10.0,
+  "hmr": false,
+  "hmr_mass": 3.024,
   "replicas": 1,
   "seed_base": 20261001,
   "strip_mask": ":WAT,Na+,Cl-,K+",

@@ -16,7 +16,8 @@
 #     [--radii {mbondi,mbondi2,mbondi3}] [--igb 8] \
 #     --outdir DIR [--top-name NAME] [--extra-leap FILE] \
 #     [--restraint-mask MASK] [--no-pdb4amber] [--allow-hetatm] \
-#     [--allow-attn] [--no-strict-qc] [--render-only] [--force]
+#     [--allow-attn] [--no-strict-qc] [--render-only] \
+#     [--hmr [--hmr-mass 3.024]] [--force]
 set -euo pipefail
 
 KIT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -25,7 +26,7 @@ GAFF="gaff2"; FF=""; SOLVENT="explicit"; WATER=""; BOX="oct"; PAD="10.0"
 CATION=""; ANION="Cl-"; COUNTERION=""; SALT_PAIRS=0; RADII=""; IGB="8"
 OUTDIR=""; TOP_NAME=""; EXTRA_LEAP=""; RESTRAINT_MASK=""
 NO_PDB4AMBER=0; ALLOW_HETATM=0; ALLOW_ATTN=0; STRICT_QC=1
-RENDER_ONLY=0; FORCE=0
+RENDER_ONLY=0; FORCE=0; HMR=0; HMR_MASS=3.024
 ORIG_ARGS=("$@")
 PROVIDED=$(printf '%s\n' "${ORIG_ARGS[@]}" | sed -n 's/^--\([^=]*\).*/\1/p' || true)
 has_provided() { printf '%s\n' "$PROVIDED" | grep -qx "$1"; }
@@ -63,6 +64,8 @@ while [ $# -gt 0 ]; do
     --allow-attn) ALLOW_ATTN=1; shift;;
     --no-strict-qc) STRICT_QC=0; shift;;
     --render-only) RENDER_ONLY=1; shift;;
+    --hmr) HMR=1; shift;;
+    --hmr-mass) HMR_MASS=$2; shift 2;;
     --force) FORCE=1; shift;;
     -h|--help) sed -n '2,22p' "$0"; exit 0;;
     *) die "unknown argument: $1";;
@@ -84,6 +87,12 @@ esac
   die "--solvent must be explicit or implicit"
 [ "$BOX" = oct ] || [ "$BOX" = rect ] || die "--box must be oct or rect"
 awk -v p="$PAD" 'BEGIN{exit(p<=0)}' || die "--pad must be > 0"
+if [ "$HMR" -eq 1 ] && [ "$RENDER_ONLY" -eq 1 ]; then
+  die "--hmr requires a real build (remove --render-only)"
+fi
+if ! awk -v m="$HMR_MASS" 'BEGIN{exit(!(m>1.008))}'; then
+  die "--hmr-mass must be > 1.008 Da"
+fi
 
 # ---- defaults by system type ---------------------------------------------
 case "$TYPE" in
@@ -211,6 +220,10 @@ RECEPTOR_ABS=$(cd "$(dirname "$RECEPTOR")" && pwd)/$(basename "$RECEPTOR")
 MANAGED=("$OUTDIR/leap.in" "$OUTDIR/tleap.out" "$OUTDIR/build_manifest.json"
          "$OUTDIR/build_qc.json" "$OUTDIR/build_qc.tsv" "$OUTDIR/receptor_clean.pdb"
          "$OUTDIR/${TOP_NAME}.prmtop" "$OUTDIR/${TOP_NAME}.inpcrd")
+if [ "$HMR" -eq 1 ]; then
+  MANAGED+=("$OUTDIR/${TOP_NAME}.prmtop.orig" "$OUTDIR/${TOP_NAME}_hmr.prmtop"
+            "$OUTDIR/hmr_manifest.json")
+fi
 if [ "$FORCE" -eq 0 ]; then
   for f in "${MANAGED[@]}"; do
     if [ -e "$f" ]; then die "refusing to overwrite $f (use --force)"; fi
@@ -414,6 +427,23 @@ QC_RC=0
 "$AMBER_MD_PY" $AMBER_MD_PY_FLAGS "$KIT_DIR/qc_system.py" "${QC_ARGS[@]}" \
   > "$OUTDIR/build_qc.tsv" 2> "$OUTDIR/build_qc.err" || QC_RC=$?
 
+# ---- HMR topology --------------------------------------------------------
+HMR_PRMTOP=""; HMR_BACKUP=""; HMR_MANIFEST=""
+if [ "$HMR" -eq 1 ]; then
+  if [ "$QC_RC" -ne 0 ] && [ "$STRICT_QC" -eq 1 ]; then
+    die "QC failed; HMR topology not generated; inspect $OUTDIR/build_qc.tsv and $OUTDIR/build_qc.err"
+  fi
+  amber_md_pick_python || die "HMR requires a Python with parmed; set AMBER_MD_PYTHON or PY_QC"
+  HMR_PRMTOP="$OUTDIR/${TOP_NAME}_hmr.prmtop"
+  HMR_BACKUP="$OUTDIR/${TOP_NAME}.prmtop.orig"
+  HMR_MANIFEST="$OUTDIR/hmr_manifest.json"
+  note "HMR: non-water H -> $HMR_MASS Da; original backup -> $HMR_BACKUP"
+  "$AMBER_MD_PY" $AMBER_MD_PY_FLAGS "$KIT_DIR/hmr_topology.py" \
+    --prmtop "$PRMTOP" --out "$HMR_PRMTOP" --backup "$HMR_BACKUP" \
+    --mass "$HMR_MASS" --json "$HMR_MANIFEST" --replace --force \
+    || die "HMR topology generation failed; see $HMR_MANIFEST"
+fi
+
 # ---- manifest ------------------------------------------------------------
 export BUILD_TYPE="$TYPE" BUILD_FF="$FF" BUILD_LEAPRC="$LEAPRC_RECEPTOR"
 export BUILD_WATER="$WATER" BUILD_SOLVENT="$SOLVENT" BUILD_BOX="$BOX" BUILD_PAD="$PAD"
@@ -424,6 +454,9 @@ export BUILD_TLEAP_ERRORS="$TLEAP_ERRORS" BUILD_TLEAP_WARN="$TLEAP_WARN"
 export BUILD_TLEAP_ATTN="$TLEAP_ATTN" BUILD_TLEAP_NETQ="$TLEAP_NETQ"
 export BUILD_LIG_RESNAME="$LIG_RESNAME" BUILD_LIG_ATOMS="$LIG_ATOMS"
 export BUILD_LIG_CHARGE="$LIG_CHARGE" BUILD_LIG_HEAVY="$LIG_HEAVY"
+export BUILD_HMR="$HMR" BUILD_HMR_MASS="$HMR_MASS"
+export BUILD_HMR_PRMTOP="$HMR_PRMTOP" BUILD_HMR_BACKUP="$HMR_BACKUP"
+export BUILD_HMR_MANIFEST="$HMR_MANIFEST"
 export BUILD_STAGE="qc_failed"
 if [ "$QC_RC" -eq 0 ]; then BUILD_STAGE="ok"; fi
 
@@ -436,6 +469,8 @@ def num(x, kind=float):
         return kind(x)
     except (TypeError, ValueError):
         return x
+hmr_path = env.get("BUILD_HMR_MANIFEST") or ""
+hmr = json.load(open(hmr_path)) if hmr_path and os.path.exists(hmr_path) else {"enabled": False}
 manifest = {
     "generated_at": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
     "generator": "amber_general_workflow/scripts/build_system.sh",
@@ -467,6 +502,7 @@ manifest = {
         "attn": num(env["BUILD_TLEAP_ATTN"], int),
         "net_charge": num(env["BUILD_TLEAP_NETQ"]),
     },
+    "hmr": hmr,
     "status": env["BUILD_STAGE"],
 }
 if os.path.exists(qc_path):

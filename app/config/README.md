@@ -64,6 +64,7 @@ bin/amber-auto run complex.pdb --config config/auto.json
 | `PROD_CHUNK_NS` | 每 chunk 长度，默认 25 ns |
 | `DT` | 积分步长，默认 0.002 ps |
 | `TRAJ_INTERVAL_PS` | 轨迹写盘间隔，默认 10 ps |
+| `HMR` / `HMR_MASS` | `1` 开启 HMR（非水氢 3.024 Da）；需 `DT=0.004`，与 `--render-only` 互斥 |
 | `SEED_BASE` | 未在 `systems.tsv` 给 `seed_base` 时的默认种子 |
 
 ### PBS

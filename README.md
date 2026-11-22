@@ -158,6 +158,7 @@ wrapper **不会**把 `auto.example.json` 作为自动回退项；若没有真�
 | `heat_ns` / `release_stages` / `release_ns` | `2.0` / `10` / `1.0` | 平衡协议 |
 | `prod_ns` / `prod_chunks` | `100.0` / `4` | 生产长度/分块 |
 | `dt` / `traj_interval_ps` | `0.002` / `10.0` | 步长/轨迹间隔 |
+| `hmr` / `hmr_mass` | `false` / `3.024` | HMR：非水氢质量重分配；`--hmr` 开启；生成 `complex_hmr.prmtop` + `complex.prmtop.orig` |
 | `replicas` / `seed_base` | `1` / `20261001` | 副本/随机种子 |
 | `strip_mask` | `:WAT,Na+,Cl-,K+` | 分析剥离 |
 | `ph` | `7.4` | 配体补氢 pH |
@@ -169,6 +170,8 @@ wrapper **不会**把 `auto.example.json` 作为自动回退项；若没有真�
 | `equil_walltime` / `prod_walltime` / `post_walltime` | `24:00:00` / `24:00:00` / `12:00:00` | walltime；大体系（>50k atoms）建议 equil 用 `--equil-walltime 48:00:00` |
 
 `--ff ff14SB` 单独使用时自动切 `water=tip3p`；`--igb 8` 单独使用时自动切 `radii=mbondi3`。
+
+`--hmr` 只重分配**非水氢**（默认 3.024 Da），水氢保持 1.008；推荐 `--dt 0.004 --traj-interval-ps 200`，模板已 `ntc=2/ntf=2`。`--render-only`、无溶质氢、D/氢化物/自由质子/H₂、已 HMR 且无 `.orig` 备份、`--hmr-mass` 非法、无 parmed、`dt > 0.004` 或 `ntc=1`、未最小化起点、QM/MM/非 Amber 引擎不适用或未验证；`resume` 不会把已有 campaign 变成 HMR，需要重建。详见 [TUTORIAL.md](TUTORIAL.md) 的 HMR 节。
 
 ### 4.3 环境变量
 
@@ -190,6 +193,7 @@ wrapper **不会**把 `auto.example.json` 作为自动回退项；若没有真�
 - `igb=5 ↔ mbondi2`，`igb=8 ↔ mbondi3`；改 `igb` 必须重建拓扑。
 - `tleap` 必须 `Errors = 0`；`ATTN` 默认失败，只有化学审查后才允许放行。
 - 显式溶剂用 `solvateOct/solvateBox` + `addIons`；隐式溶剂用 `igb`/`saltcon`，不加水。
+- `hmr=true` ⇔ 使用 HMR 拓扑 + `dt=0.004`（推荐）；水氢不变；`--render-only` 与 `--hmr` 互斥。
 
 ## 5. 批量调度与资源管理
 
@@ -245,6 +249,7 @@ wrapper **不会**把 `auto.example.json` 作为自动回退项；若没有真�
     prepare/                        # protein/ligand 准备产物、Reduce 日志、二硫键
     ligands/<RESNAME>/              # lig.mol2、lig.frcmod、antechamber/parmchk2 日志
     systems/<label>/                # prmtop/inpcrd、masks.env、QC、linkage
+                                    # --hmr: complex_hmr.prmtop、complex.prmtop.orig、hmr_manifest.json
     md/<label>/r<rep>/              # MD 输入、run_*.pbs、轨迹、restart、锁文件
     analysis/                       # cpptraj、python npz/json、mmpbsa、tables
     logs/                           # 每作业自写日志 <jobname>.o<jobid>
@@ -258,6 +263,7 @@ wrapper **不会**把 `auto.example.json` 作为自动回退项；若没有真�
 - `npt.rst7`、`prod_final.rst7` 为最后一段 restart 的副本；
 - `analysis/post_status_<prefix>.json` 的 `steps`（0=成功，1=失败，2=跳过）；
 - `.run_equil.lock` / `.run_prod.lock` / `.run_prod_cNN.lock` 防止同副本并发。
+- `--hmr`：`build_manifest.json` 的 `hmr.status=ok`，`complex_hmr.prmtop`/`complex.prmtop.orig`/`hmr_manifest.json` 存在；`run_config.json` 的 `hmr.enabled=true`。
 
 ## 7. 运维与故障排查
 
@@ -298,6 +304,11 @@ qstat -u "$USER"
 | 作业被杀 | walltime 不足/节点故障 | `resume`；检查 `#PBS -l walltime` |
 | 续跑后重复建系报 duplicate | 同一 campaign 再次 `run` 同一 PDB | 用 `resume`，或新建 campaign，或 `--force` |
 | dry-run 后状态异常 | 旧版本会写 DRY job | 本版本 dry-run 不写 campaign 状态 |
+| `--hmr` 报 `requires a real build` | 与 `--render-only` 同用 | 去掉 `--render-only`；HMR 需要真实 prmtop |
+| `--hmr` 报 `no non-water hydrogens` | 体系没有溶质氢 | HMR 无效；不要用 4 fs |
+| `--hmr` 报 `already looks like HMR` | 拓扑已 HMR 且缺 `.orig` 备份 | `--force` 重建，或恢复原拓扑 |
+| `--hmr` 报 `non-positive mass` | `--hmr-mass` 过大 | 用默认 3.024 Da |
+| 4 fs 启动 `TEMP/EKtot=NaN` | 从**未最小化**结构直接跑 | 从 min2/heat 起点；流程的 heat 已如此 |
 
 ## 8. 扩展开发规范
 
@@ -325,6 +336,7 @@ qstat -u "$USER"
 - 新增实验性 GPU 最小化：`min_engine` 与 `--min-engine`；新增 `app/pbs/run_equil_gpu_min.pbs.in`，min1/min2 走 `pmemd.cuda`。**默认仍为 `sander`**；本示例 87k 体系实测 `BOND` 发散，未启用。
 - 统一终端输出：新增 `app/scripts/sch_ui.py` / `app/scripts/lib/ui.sh` 与 `app/docs/CLI_STYLE.md`；`--color=auto|always|never`，日志/JSON/PBS 保持纯文本。
 - 文档拆分：新增根 `README.md`（管理员）与根 `TUTORIAL.md`（用户）；`app/README.md` 收缩为索引。
+- 新增可选 HMR：`hmr` / `hmr_mass`、`--hmr` / `--no-hmr` / `--hmr-mass`；`build_system.sh --hmr` 在 QC 后生成 `complex_hmr.prmtop`（ParmEd `HMassRepartition`，水氢不变）并备份 `complex.prmtop.orig`；`setup_md_inputs --hmr` 写入 `run_config.hmr`；`amber-kit` 新增 `HMR` / `HMR_MASS`。默认关闭；`--render-only` 与 HMR 互斥。
 
 ## 10. 文档地图
 
