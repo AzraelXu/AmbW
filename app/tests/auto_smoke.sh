@@ -11,6 +11,9 @@ KIT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$KIT"
 TMP=$(mktemp -d /tmp/amber_auto_smoke.XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
+# Keep bytecode out of the (possibly read-only) install tree.
+export PYTHONPYCACHEPREFIX="$TMP/pycache"
+mkdir -p "$PYTHONPYCACHEPREFIX"
 PASS=0
 FAIL=0
 ok() { PASS=$((PASS+1)); echo "OK   $*"; }

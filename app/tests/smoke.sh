@@ -18,7 +18,10 @@ DATA="$KIT/tests/data"
 export PYTHONDONTWRITEBYTECODE=1
 PY_QC=${PY_QC:-/opt/software/amber_general_workflow/envs/qc/bin/python}
 TMP=$(mktemp -d /tmp/agw_smoke.XXXXXX)
-cleanup() { rm -rf "$TMP" "$KIT/scripts/__pycache__"; }
+# Keep bytecode out of the (possibly read-only) install tree.
+export PYTHONPYCACHEPREFIX="$TMP/pycache"
+mkdir -p "$PYTHONPYCACHEPREFIX"
+cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 FAIL=0
 ok()   { echo "OK   $*"; }
