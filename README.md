@@ -166,7 +166,7 @@ wrapper **不会**把 `auto.example.json` 作为自动回退项；若没有真�
 | `param_pbs` / `param_ppn` / `param_walltime` / `param_amber_sh` / `param_nodes` | `false`（site 为 `true`）/ `40` / `04:00:00` / `null`（site 为 conda ABT 的 `amber.sh`）/ `null`（site 为 `1`） | 配体 AM1-BCC 参数化是否提交 PBS、申请 CPU 数、walltime、AmberTools 环境、节点 |
 | `min_engine` | `sander` | 最小化引擎；`pmemd.cuda` 为实验选项，未通过本示例验证（见下） |
 | `pbs_queue` / `pbs_nodes` / `ppn` / `gpus` | `batch` / `1` / `8` / `1` | Torque 资源 |
-| `equil_walltime` / `prod_walltime` / `post_walltime` | `24:00:00` / `24:00:00` / `12:00:00` | walltime |
+| `equil_walltime` / `prod_walltime` / `post_walltime` | `24:00:00` / `24:00:00` / `12:00:00` | walltime；大体系（>50k atoms）建议 equil 用 `--equil-walltime 48:00:00` |
 
 `--ff ff14SB` 单独使用时自动切 `water=tip3p`；`--igb 8` 单独使用时自动切 `radii=mbondi3`。
 

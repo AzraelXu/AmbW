@@ -201,6 +201,7 @@ tail -n 50 "$CAMP"/complexes/*/logs/*.o* 2>/dev/null
 | `--param-walltime` | 参数化作业 walltime | 默认 `04:00:00` |
 | `--param-amber-sh` | 参数化使用的 AmberTools `amber.sh` | 站点默认 conda ABT；`/opt` Amber22 的 sqm 是串行的 |
 | `--param-nodes` | 参数化 PBS 作业节点 | 默认跟 `pbs_nodes`；站点设为 `1` 让调度器挑空闲节点 |
+| `--equil-walltime` | 平衡作业 walltime | 大体系建议 `48:00:00`；被 walltime 杀掉后 `resume` 会跳过已完成的 min/stage |
 | `--min-engine` | 最小化引擎 `sander` / `pmemd.cuda` | 默认 `sander`；`pmemd.cuda` 为实验选项，本示例大体系实测 BOND 发散，不建议直接用 |
 | `--mmpbsa-interval` | MM/GBSA 取帧间隔 | 10 ns 轨迹建议 20（后 50% 约 25 帧） |
 | `--no-mmpbsa` | 关闭 MM/GBSA | 只做结构分析时用 |
