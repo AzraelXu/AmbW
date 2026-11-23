@@ -4,7 +4,7 @@
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_NAME="rna_lig"
 
-AMBER_SH="/opt/software/amber22/amber.sh"
+AMBER_SH="/home/ylqx/amber22/amber.sh"
 PY_QC="/opt/software/amber_general_workflow/envs/qc/bin/python"
 PY_ANALYSIS="/opt/software/amber_general_workflow/envs/analysis/bin/python"
 MPIRUN="mpirun"

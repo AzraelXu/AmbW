@@ -21,7 +21,7 @@ PROJECT_NAME="my_project"
 # -----------------------------------------------------------------------------
 # 可执行环境
 # -----------------------------------------------------------------------------
-AMBER_SH="/opt/software/amber22/amber.sh"
+AMBER_SH="/home/ylqx/amber22/amber.sh"
 # QC/建系需要 parmed；本机 ambertools_env 有 parmed 4.2 + numpy 1.24
 PY_QC="/opt/software/amber_general_workflow/envs/qc/bin/python"
 # 分析需要 MDAnalysis/scipy + numpy；本机 prolif 环境（MDA 2.7 / scipy 1.13）。

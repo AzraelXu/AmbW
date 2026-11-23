@@ -35,7 +35,7 @@ PY_ANALYSIS="/opt/software/amber_general_workflow/envs/analysis/bin/python"
 HBOND_STRIDE="2"
 NO_HBOND=0
 FRAME_PS="10"
-AMBER_SH="/opt/software/amber22/amber.sh"
+AMBER_SH="/home/ylqx/amber22/amber.sh"
 FORCE=0
 
 while [ $# -gt 0 ]; do

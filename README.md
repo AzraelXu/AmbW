@@ -72,7 +72,7 @@ app/logs/                      # 旧流程日志占位
 
 | 组件 | 用途 | 站点默认 |
 |---|---|---|
-| Amber 22 / AmberTools 22 | `tleap`、`pdb4amber`、`antechamber`、`parmchk2`、`pmemd.cuda`、`sander.MPI`、`cpptraj`、`MMPBSA.py` | `/opt/software/amber22` |
+| Amber 22 / AmberTools 22 | `tleap`、`pdb4amber`、`antechamber`、`parmchk2`、`pmemd.cuda`、`sander.MPI`、`cpptraj`、`MMPBSA.py` | `/home/ylqx/amber22` |
 | conda env `qc` | parmed、numpy；建系 QC、masks、linkage | `/opt/software/amber_general_workflow/envs/qc` |
 | conda env `analysis` | RDKit、MDAnalysis、scipy、netCDF4、pandas；电荷推断、分析、汇总 | `/opt/software/amber_general_workflow/envs/analysis` |
 | OpenBabel | 无氢配体补氢/键级感知 | `/opt/schrodinger2021-2/utilities/obabel` |
@@ -145,7 +145,7 @@ wrapper **不会**把 `auto.example.json` 作为自动回退项；若没有真�
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `amber_sh` | `/opt/software/amber22/amber.sh` | Amber 环境脚本 |
+| `amber_sh` | `/home/ylqx/amber22/amber.sh` | Amber 环境脚本 |
 | `rdkit_python` | analysis env | 配体电荷推断 |
 | `py_qc` | qc env | 建系 QC/masks/linkage |
 | `py_analysis` | analysis env | 轨迹分析/汇总 |
@@ -273,7 +273,7 @@ wrapper **不会**把 `auto.example.json` 作为自动回退项；若没有真�
 ./bin/amber-auto --help
 /opt/software/amber_general_workflow/envs/qc/bin/python -I -c 'import parmed,numpy'
 /opt/software/amber_general_workflow/envs/analysis/bin/python -I -c 'import rdkit,MDAnalysis,netCDF4'
-source /opt/software/amber22/amber.sh
+source /home/ylqx/amber22/amber.sh
 command -v tleap pdb4amber antechamber parmchk2 cpptraj pmemd.cuda sander.MPI MMPBSA.py
 qstat -q
 pbsnodes -a node02 | grep -E 'state =|np =|gpus =|availmem'

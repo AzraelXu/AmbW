@@ -133,7 +133,7 @@ load_config() {
   : "${MPIRUN:=mpirun}"
   : "${PY_QC:=python3}"
   : "${PY_ANALYSIS:=python3}"
-  : "${AMBER_SH:=/opt/software/amber22/amber.sh}"
+  : "${AMBER_SH:=/home/ylqx/amber22/amber.sh}"
   case "$AMBER_SH" in /*) ;; *) AMBER_SH="$PROJECT_ROOT/$AMBER_SH";; esac
   : "${ANALYSIS_WINDOW:=last50}"
   : "${CONTACT_CUTOFF:=4.0}"

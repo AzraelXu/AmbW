@@ -375,7 +375,7 @@ def main():
     ap.add_argument("--rdkit-python",
                     default="/opt/software/amber_general_workflow/envs/analysis/bin/python")
     ap.add_argument("--obabel", default="/opt/schrodinger2021-2/utilities/obabel")
-    ap.add_argument("--amber-sh", default="/opt/software/amber22/amber.sh")
+    ap.add_argument("--amber-sh", default="/home/ylqx/amber22/amber.sh")
     ap.add_argument("--drop-glycans", action="store_true")
     ap.add_argument("--drop-metals", action="store_true")
     ap.add_argument("--drop-modified", action="store_true")

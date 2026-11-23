@@ -211,7 +211,7 @@ amber-kit submit multi-gpu --pair lig1:1,lig1:2,lig2:1,lig2:2 --dry-run
 ## 8. 手工提交示例
 
 ```bash
-source /opt/software/amber22/amber.sh
+source /home/ylqx/amber22/amber.sh
 
 # 平衡
 cd /path/to/project/md/lig1/r1

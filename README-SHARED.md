@@ -16,7 +16,7 @@
 ```
 
 不需要 `source amber.sh`，也不需要 `conda activate`；入口脚本会自己处理。
-Amber 使用 `/opt/software/amber22`，OpenBabel 使用
+Amber 使用 `/home/ylqx/amber22`，OpenBabel 使用
 `/opt/schrodinger2021-2/utilities/obabel`。
 
 ## 普通用户：三步
@@ -117,8 +117,10 @@ sudo chmod -R go-w /opt/software/amber_general_workflow
 
 更新代码时，把新版本 rsync 到 `app/`（排除 `__pycache__`、campaign），并把代码/配置里的
 `/home/user1/Software/anaconda3/envs/...` 替换为
-`/opt/software/amber_general_workflow/envs/{qc,analysis}`，
-`/home/ylqx/amber22` 替换为 `/opt/software/amber22`，再把 `app/bin/amber-auto` 的
+`/opt/software/amber_general_workflow/envs/{qc,analysis}`。
+默认 Amber 是 `/home/ylqx/amber22/amber.sh`（本集群 `/opt/software/amber22` 的
+sander 串行/MPI 有问题，故默认改用前者）；如果目标共享安装的 Amber 位于
+`/opt/software/amber22`，再把 `amber_sh`/`param_amber_sh` 相应替换。再把 `app/bin/amber-auto` 的
 shebang 改为 `/opt/software/amber_general_workflow/envs/analysis/bin/python`，
 并用 patched `config/auto.example.json` 生成 `config/auto.site.json`。
 本安装的完整部署步骤可用 `history`/本 README 复现。

@@ -43,7 +43,7 @@ done
 # 2. render-only tleap inputs
 # ---------------------------------------------------------------------------
 set +u   # amber.sh reads possibly-unset LD_LIBRARY_PATH/PYTHONPATH
-source /opt/software/amber22/amber.sh >/dev/null 2>&1 || true
+source /home/ylqx/amber22/amber.sh >/dev/null 2>&1 || true
 set -u
 command -v tleap >/dev/null 2>&1 || { echo "tleap not found; source amber.sh first" >&2; exit 2; }
 
@@ -160,7 +160,7 @@ import glob, os, re, subprocess, sys
 kit, tmp = sys.argv[1], sys.argv[2]
 vals = dict(JOB_NAME='test_job', QUEUE='batch', NODES='1', PPN='8', GPUS='1',
             WALLTIME='24:00:00', JOIN='oe', LOG_DIR=tmp + '/logs/', MAIL='n',
-            AMBER_SH='/opt/software/amber22/amber.sh', MPIRUN='mpirun',
+            AMBER_SH='/home/ylqx/amber22/amber.sh', MPIRUN='mpirun',
             TOP='complex.prmtop', CRD='complex.inpcrd', MIN1='01_min_restraint',
             MIN2='02_min_free', HEAT='03_heat', RELEASE_STEMS='04a 04b',
             LAST_RELEASE='04b', PROD_STEMS='05_prod_c01 05_prod_c02',

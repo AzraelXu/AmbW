@@ -10,7 +10,7 @@
 ## 1. 环境要求
 
 ```bash
-source /opt/software/amber22/amber.sh          # Amber22
+source /home/ylqx/amber22/amber.sh          # Amber22
 /opt/software/amber_general_workflow/envs/analysis/bin/python -c "import rdkit"   # 电荷推断
 /opt/software/amber_general_workflow/envs/qc/bin/python -c "import parmed, numpy"
 /opt/software/amber_general_workflow/envs/analysis/bin/python -c "import MDAnalysis, scipy"

@@ -50,7 +50,7 @@ inputs/ ligands/ systems/ md/ analysis/ logs/
 ```bash
 PROJECT_NAME="my_project"
 
-AMBER_SH="/opt/software/amber22/amber.sh"        # 你的 Amber 初始化脚本
+AMBER_SH="/home/ylqx/amber22/amber.sh"        # 你的 Amber 初始化脚本
 PY_QC="/opt/software/amber_general_workflow/envs/qc/bin/python"   # 有 parmed
 PY_ANALYSIS="/opt/software/amber_general_workflow/envs/analysis/bin/python"      # 有 MDAnalysis
 
@@ -183,7 +183,7 @@ FATAL: Atom .R<G5 1>.A<OP1 34> does not have a type.
 ### 3.1 单配体
 
 ```bash
-source /opt/software/amber22/amber.sh
+source /home/ylqx/amber22/amber.sh
 export AMBER_MD_PYTHON=/opt/software/amber_general_workflow/envs/qc/bin/python
 
 scripts/param_ligand.sh \

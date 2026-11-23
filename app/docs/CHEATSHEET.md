@@ -3,7 +3,7 @@
 ## 环境
 
 ```bash
-source /opt/software/amber22/amber.sh
+source /home/ylqx/amber22/amber.sh
 which pmemd.cuda cpptraj tleap antechamber parmchk2
 qstat -a
 ```

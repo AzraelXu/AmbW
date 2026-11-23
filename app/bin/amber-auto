@@ -89,7 +89,7 @@ sys.path.insert(0, SCRIPTS)
 import sch_ui  # noqa: E402  (SCRIPTS is defined above)
 
 DEFAULTS = {
-    "amber_sh": "/opt/software/amber22/amber.sh",
+    "amber_sh": "/home/ylqx/amber22/amber.sh",
     "rdkit_python": "/opt/software/amber_general_workflow/envs/analysis/bin/python",
     "py_qc": "/opt/software/amber_general_workflow/envs/qc/bin/python",
     "py_analysis": "/opt/software/amber_general_workflow/envs/analysis/bin/python",
