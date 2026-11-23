@@ -2,7 +2,58 @@
 # Shared entry point for amber_general_workflow.
 # Users may export AMBER_AUTO_CONFIG=/path/to/your-auto.json to override the
 # site configuration; command-line --config still takes precedence.
+# AMBER_AUTO_PYTHON selects the interpreter (command name or absolute path).
 HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
-: "${AMBER_AUTO_CONFIG:=$HERE/config/auto.site.json}"
-export AMBER_AUTO_CONFIG
-exec "$HERE/envs/analysis/bin/python" "$HERE/app/bin/amber-auto" "$@"
+
+UI_LIB="$HERE/app/scripts/lib/ui.sh"
+HAVE_UI=0
+if [ -f "$UI_LIB" ]; then
+  HAVE_UI=1
+  export UI_CMD_PREFIXES="${UI_CMD_PREFIXES:-amber-}"
+  # shellcheck source=app/scripts/lib/ui.sh
+  source "$UI_LIB"
+  ui_parse_color_args "$@" || exit $?
+  set -- "${UI_ARGS[@]+"${UI_ARGS[@]}"}"
+fi
+
+resolve_python() {
+  local cand
+  if [ -n "${AMBER_AUTO_PYTHON:-}" ]; then
+    command -v "$AMBER_AUTO_PYTHON" 2>/dev/null && return 0
+    return 1
+  fi
+  for cand in "$HERE/envs/analysis/bin/python" \
+              "/opt/software/amber_general_workflow/envs/analysis/bin/python"; do
+    if [ -x "$cand" ]; then
+      command -v "$cand"
+      return 0
+    fi
+  done
+  command -v python3 2>/dev/null && return 0
+  return 1
+}
+
+PYTHON=$(resolve_python) || {
+  if [ "$HAVE_UI" -eq 1 ]; then
+    error "no usable Python found; set AMBER_AUTO_PYTHON=/path/to/python"
+  else
+    echo "error: no usable Python found; set AMBER_AUTO_PYTHON=/path/to/python" >&2
+  fi
+  exit 2
+}
+AMBER_AUTO_PYTHON=$PYTHON
+export AMBER_AUTO_PYTHON
+
+# Prefer a real site config over the example file: an example may contain
+# placeholder paths that would override DEFAULTS with unusable values.
+if [ -z "${AMBER_AUTO_CONFIG:-}" ]; then
+  for cand in "$HERE/config/auto.site.json" "$HERE/app/config/auto.site.json"; do
+    if [ -f "$cand" ]; then
+      AMBER_AUTO_CONFIG=$cand
+      break
+    fi
+  done
+fi
+[ -n "${AMBER_AUTO_CONFIG:-}" ] && export AMBER_AUTO_CONFIG
+
+exec "$AMBER_AUTO_PYTHON" "$HERE/app/bin/amber-auto" "$@"

@@ -558,6 +558,7 @@ cmd_build() {
         bargs+=(--ligand "$ligdir/lig.mol2" --frcmod "$ligdir/lig.frcmod"
                 --lig-resname "$resname_use" --ligand-pdb "$ligand_pdb_use" --gaff "$GAFF")
       fi
+      [ "${HMR:-0}" -eq 1 ] && bargs+=(--hmr --hmr-mass "${HMR_MASS:-3.024}")
       [ "$render_only" -eq 1 ] && bargs+=(--render-only)
       [ "$force" -eq 1 ] && bargs+=(--force)
       note "$label ${model_tag:-single}: build_system -> $outdir"
@@ -637,6 +638,7 @@ cmd_inputs() {
                   --release-ns "$RELEASE_NS" --prod-chunks "$PROD_CHUNKS"
                   --prod-chunk-ns "$PROD_CHUNK_NS" --dt "$DT"
                   --traj-interval-ps "$TRAJ_INTERVAL_PS")
+      [ "${HMR:-0}" -eq 1 ] && args+=(--hmr --hmr-mass "${HMR_MASS:-3.024}")
       if is_holo; then
         local resname_use; resname_use=$(resname_for_row "$resname")
         args+=(--ligand-resname "$resname_use")

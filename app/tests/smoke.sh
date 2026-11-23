@@ -18,7 +18,10 @@ DATA="$KIT/tests/data"
 export PYTHONDONTWRITEBYTECODE=1
 PY_QC=${PY_QC:-/opt/software/amber_general_workflow/envs/qc/bin/python}
 TMP=$(mktemp -d /tmp/agw_smoke.XXXXXX)
-cleanup() { rm -rf "$TMP" "$KIT/scripts/__pycache__"; }
+# Keep bytecode out of the (possibly read-only) install tree.
+export PYTHONPYCACHEPREFIX="$TMP/pycache"
+mkdir -p "$PYTHONPYCACHEPREFIX"
+cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 FAIL=0
 ok()   { echo "OK   $*"; }
@@ -69,6 +72,18 @@ run_render protein_holo --type protein-ligand --receptor "$DATA/tiny_peptide.pdb
   --ligand "$DATA/lig.mol2" --frcmod "$DATA/lig.frcmod" --lig-resname LIG \
   --ligand-pdb "$DATA/ethanol.pdb" --gaff gaff2 \
   --ff ff19SB --solvent explicit --water opc --box oct --pad 10.0 --counterion none
+if "$KIT/scripts/build_system.sh" --type protein-ligand --receptor "$DATA/tiny_peptide.pdb" \
+    --ligand "$DATA/lig.mol2" --frcmod "$DATA/lig.frcmod" --lig-resname LIG \
+    --ligand-pdb "$DATA/ethanol.pdb" --gaff gaff2 \
+    --ff ff19SB --solvent explicit --water opc --box oct --pad 10.0 --counterion none \
+    --outdir "$TMP/render_hmr" --render-only --hmr --force \
+    >"$TMP/render_hmr.log" 2>&1; then
+  bad "render-only rejects --hmr"
+elif grep -q -- '--hmr requires a real build' "$TMP/render_hmr.log"; then
+  ok "render-only rejects --hmr"
+else
+  bad "render-only rejects --hmr (unexpected error)"
+fi
 
 # ---------------------------------------------------------------------------
 # 3. tiny real tleap builds
@@ -97,7 +112,15 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
   run_build protein_holo --type protein-ligand --receptor "$DATA/tiny_peptide.pdb" \
     --ligand "$DATA/lig.mol2" --frcmod "$DATA/lig.frcmod" --lig-resname LIG \
     --ligand-pdb "$DATA/ethanol.pdb" --gaff gaff2 \
-    --ff ff19SB --solvent explicit --water opc --box oct --pad 10.0 --counterion none
+    --ff ff19SB --solvent explicit --water opc --box oct --pad 10.0 --counterion none \
+    --hmr
+  if [ -s "$TMP/build_protein_holo/complex_hmr.prmtop" ] \
+     && [ -s "$TMP/build_protein_holo/complex.prmtop.orig" ] \
+     && [ -s "$TMP/build_protein_holo/hmr_manifest.json" ]; then
+    ok "HMR topology"
+  else
+    bad "HMR topology"
+  fi
 
   if [ -s "$TMP/build_protein_holo/complex.prmtop" ]; then
     if "$PY_QC" -I "$KIT/scripts/residue_masks.py" \
@@ -118,7 +141,8 @@ fi
 if python3 -I "$KIT/scripts/setup_md_inputs.py" \
     --out "$TMP/md_inputs" --seed 12345 --receptor-type rna --solvent explicit \
     --restraint-mask ':1-3 & !@H=' --heat-ns 0.1 --release-stages 2 \
-    --release-ns 0.1 --prod-chunks 2 --prod-chunk-ns 0.1 --print-only \
+    --release-ns 0.1 --prod-chunks 2 --prod-chunk-ns 0.1 \
+    --hmr --dt 0.004 --traj-interval-ps 200 --print-only \
     >"$TMP/setup_md.out" 2>"$TMP/setup_md.err"; then
   grep -q '01_min_restraint.in' "$TMP/setup_md.out" \
     && grep -q '04a.in' "$TMP/setup_md.out" \

@@ -1,7 +1,9 @@
 #!/bin/bash
 # =============================================================================
 # CPU 作业：单个配体的 GAFF2/AM1-BCC 参数化（antechamber + parmchk2）
-# 不申请 GPU；sqm 是串行的，ppn 只是为了给 antechamber 留线程余量。
+# 不申请 GPU；在计算节点运行 sqm。默认申请 40 CPU，并设置 OMP/MKL/OpenBLAS 线程数：
+# conda ABT 的 sqm 链接 OpenBLAS pthreads，OPENBLAS_NUM_THREADS 生效；
+# /opt Amber22 的 sqm 链接静态 BLAS，是串行的（只占 1 核）。
 # =============================================================================
 #PBS -N {{JOB_NAME}}
 #PBS -q {{QUEUE}}
@@ -15,6 +17,7 @@ set -o pipefail
 
 # 本集群 Torque 未把 #PBS -o 的输出写回 NFS；作业自身再落一份日志到 LOG_DIR。
 exec >>"{{LOG_DIR}}{{JOB_NAME}}.o${PBS_JOBID%%.*}" 2>&1
+export SCH_COLOR=never
 
 cd "$PBS_O_WORKDIR" || { echo "无法进入 PBS_O_WORKDIR=$PBS_O_WORKDIR"; exit 1; }
 # 清除继承的 OpenMPI 库路径，避免与 {{AMBER_SH}} 的 OpenMPI 版本混用；
@@ -30,7 +33,15 @@ set +u
 source "{{AMBER_SH}}" || { echo "source {{AMBER_SH}} 失败"; exit 1; }
 set -u
 
+# Let OpenMP/MKL/OpenBLAS-enabled builds use the full CPU allocation.
+export OMP_NUM_THREADS="{{PPN}}"
+export MKL_NUM_THREADS="{{PPN}}"
+export OPENBLAS_NUM_THREADS="{{PPN}}"
+
 echo "HOST=$(hostname) DIR=$PBS_O_WORKDIR JOB=$PBS_JOBID"
+echo "PPN={{PPN}} nproc=$(nproc) OMP_NUM_THREADS=${OMP_NUM_THREADS:-} OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-}"
+echo "AMBERHOME=${AMBERHOME:-} sqm=$(command -v sqm)"
+ldd "$(command -v sqm)" 2>/dev/null | grep -iE 'openblas|blas' | head -3 || true
 "{{KIT_DIR}}/scripts/param_ligand.sh" \
   --pdb "{{LIGAND_PDB}}" \
   --charge "{{CHARGE}}" \
@@ -40,4 +51,5 @@ echo "HOST=$(hostname) DIR=$PBS_O_WORKDIR JOB=$PBS_JOBID"
   --force
 rc=$?
 echo "param_ligand exit=$rc"
+printf '%s\n' "$rc" > "{{OUTDIR}}/param_status.txt"
 exit "$rc"

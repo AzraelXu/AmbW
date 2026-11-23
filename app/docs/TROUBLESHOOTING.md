@@ -107,8 +107,20 @@ bond com.26.SG com.84.SG
 - 初始几何重叠：多最小化、修姿态；
 - 电荷/参数错：看 `build_qc.tsv`、`parmchk2`；
 - 约束 mask 错（约束到水/离子）；
-- `dt` 太大（没有 HMR 时不要超过 0.002 ps）；
+- `dt` 太大（没有 HMR 时不要超过 0.002 ps；HMR 最多 0.004 ps，且必须 `ntc=2/ntf=2` + 最小化起点）；
 - 盒子太小。
+
+### HMR / 4 fs
+
+`--hmr` 只重分配非水氢；水氢保持 1.008。常见错误与禁用条件：
+
+- `--render-only` + `--hmr`：直接报 `--hmr requires a real build`；去掉 `--render-only`。
+- `--hmr` 报 `no non-water hydrogens`：体系只有水/离子；HMR 是 no-op，不要用 4 fs。
+- `--hmr` 报 `already looks like HMR ... no original backup`：拓扑已 HMR 且缺 `complex.prmtop.orig`；`--force` 重建或恢复原拓扑。
+- `--hmr` 报 `non-positive mass`：`--hmr-mass` 太大；用默认 3.024 Da。
+- 4 fs 启动 `TEMP/EKtot=NaN`：从**未最小化** `complex.inpcrd` 直接跑。正式 heat 从 min2 restart 启动；不要跳过 min/heat。
+- `hmr_manifest.json` 的 `water_h_mass_*` 不是 1.008：停止，检查水模型/拓扑，不要强行跑。
+- 其他不适用/未验证：氘代、氢化物、自由质子、H₂ 等 H 不接在重原子上；QM/MM；非 Amber 引擎；`dt > 0.004`；`ntc=1/ntf=1`；依赖 H 质量的动力学量（速度自相关、扩散、转动相关、振动谱、H 动能）；已有非 HMR campaign 需 `--force` 重建。
 
 ### GPU PME box 错误
 

@@ -27,6 +27,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
+import traceback
 
 
 def _reexec_with_newer_python():
@@ -83,6 +85,9 @@ KIT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 SCRIPTS = os.path.join(KIT_DIR, "scripts")
 PBS_DIR = os.path.join(KIT_DIR, "pbs")
 
+sys.path.insert(0, SCRIPTS)
+import sch_ui  # noqa: E402  (SCRIPTS is defined above)
+
 DEFAULTS = {
     "amber_sh": "/opt/software/amber22/amber.sh",
     "rdkit_python": "/opt/software/amber_general_workflow/envs/analysis/bin/python",
@@ -106,6 +111,8 @@ DEFAULTS = {
     "prod_chunks": 4,
     "dt": 0.002,
     "traj_interval_ps": 10.0,
+    "hmr": False,
+    "hmr_mass": 3.024,
     "replicas": 1,
     "seed_base": 20261001,
     "strip_mask": ":WAT,Na+,Cl-,K+",
@@ -116,6 +123,12 @@ DEFAULTS = {
     "mmpbsa_igb": 5,
     "mmpbsa_saltcon": 0.12,
     "mmpbsa_interval": 100,
+    "param_pbs": False,
+    "param_ppn": 40,
+    "param_walltime": "04:00:00",
+    "param_amber_sh": None,
+    "param_nodes": None,
+    "min_engine": "sander",
     "pbs_queue": "batch",
     "pbs_nodes": "1",
     "ppn": 8,
@@ -128,6 +141,7 @@ DEFAULTS = {
 }
 
 VERBOSE = False
+JSON_MODE = False
 
 
 class BuildError(Exception):
@@ -139,16 +153,20 @@ class SubmissionError(Exception):
 
 
 def die(msg, code=2):
-    print(f"error: {msg}", file=sys.stderr)
+    sch_ui.fatal(msg)
     sys.exit(code)
 
 
 def warn(msg):
-    print(f"warning: {msg}", file=sys.stderr)
+    sch_ui.warn(msg)
 
 
 def note(msg):
-    print(f"[amber-auto] {msg}", file=sys.stderr)
+    text = f"[amber-auto] {msg}"
+    if JSON_MODE:
+        print(text, file=sys.stderr)
+    else:
+        sch_ui.info(text)
 
 
 def now():
@@ -163,8 +181,10 @@ def tail(text, n=30):
 def run(cmd, cwd=None, check=False, quiet=False, env=None):
     if VERBOSE and not quiet:
         print("+ " + " ".join(shlex.quote(str(x)) for x in cmd), file=sys.stderr)
+    child_env = os.environ.copy() if env is None else dict(env)
+    child_env["SCH_COLOR"] = "never"
     try:
-        proc = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+        proc = subprocess.run(cmd, cwd=cwd, env=child_env, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True)
     except OSError as exc:
         proc = subprocess.CompletedProcess(
@@ -214,9 +234,13 @@ def load_config(args):
         "radii": "radii", "igb": "igb", "heat_ns": "heat_ns",
         "release_stages": "release_stages", "release_ns": "release_ns",
         "prod_ns": "prod_ns", "prod_chunks": "prod_chunks", "dt": "dt",
-        "traj_interval_ps": "traj_interval_ps", "replicas": "replicas",
+        "traj_interval_ps": "traj_interval_ps",
+        "hmr_mass": "hmr_mass", "replicas": "replicas",
         "seed_base": "seed_base", "pbs_queue": "pbs_queue",
         "pbs_nodes": "pbs_nodes", "ppn": "ppn",
+        "param_ppn": "param_ppn", "param_walltime": "param_walltime",
+        "param_amber_sh": "param_amber_sh", "param_nodes": "param_nodes",
+        "min_engine": "min_engine",
         "gpus": "gpus", "equil_walltime": "equil_walltime",
         "prod_walltime": "prod_walltime", "post_walltime": "post_walltime",
         "mmpbsa_method": "mmpbsa_method", "mmpbsa_igb": "mmpbsa_igb",
@@ -233,6 +257,10 @@ def load_config(args):
         cfg["mmpbsa"] = False
     if getattr(args, "no_reduce", False):
         cfg["no_reduce"] = True
+    if getattr(args, "hmr", None) is not None:
+        cfg["hmr"] = bool(args.hmr)
+    if getattr(args, "param_pbs", None) is not None:
+        cfg["param_pbs"] = args.param_pbs
     if getattr(args, "mmpbsa_igb", None) is not None:
         cfg["mmpbsa_igb"] = args.mmpbsa_igb
     # Friendly pairing when the user changes only one half of a standard pair.
@@ -254,8 +282,26 @@ def validate_config(cfg):
         die("--heat-ns must be > 0")
     if float(cfg["dt"]) <= 0:
         die("--dt must be > 0")
+    if cfg.get("hmr"):
+        try:
+            hmr_mass = float(cfg["hmr_mass"])
+        except (TypeError, ValueError):
+            die("hmr_mass must be a number")
+        if hmr_mass <= 1.008:
+            die("--hmr-mass must be > 1.008 Da")
+        if float(cfg["dt"]) > 0.004 + 1e-12:
+            warn("--hmr with --dt > 0.004 ps is not validated; "
+                 "0.004 ps is the tested maximum")
     if float(cfg["pad"]) <= 0:
         die("--pad must be > 0")
+    if int(cfg["param_ppn"]) < 1:
+        die("--param-ppn must be >= 1")
+    if cfg.get("param_pbs"):
+        param_sh = cfg.get("param_amber_sh") or cfg["amber_sh"]
+        if not os.path.isfile(param_sh):
+            die(f"parameterization amber.sh not found: {param_sh}")
+    if cfg.get("min_engine") not in ("sander", "pmemd.cuda"):
+        die("--min-engine must be sander or pmemd.cuda")
     if cfg["solvent"] not in ("explicit", "implicit"):
         die("--solvent must be explicit or implicit")
 
@@ -418,10 +464,17 @@ def amber_env(cfg):
     """
     env = os.environ.copy()
     env["AMBER_MD_AMBER_SH"] = cfg["amber_sh"]
+    py_qc = cfg.get("py_qc")
+    if py_qc and os.path.isfile(py_qc) and os.access(py_qc, os.X_OK):
+        env["AMBER_MD_PYTHON"] = py_qc
+    elif py_qc:
+        warn(f"py_qc is not executable: {py_qc}; QC will fall back to PATH")
     return env
 
 
 def param_ligand(manifest, cdir, cfg, force=True):
+    if cfg.get("param_pbs"):
+        return param_ligand_pbs(manifest, cdir, cfg)
     prep = manifest["prepared"]
     ligdir = os.path.join(cdir, "ligands", manifest["ligand"].get("resname", "LIG"))
     cmd = ["bash", os.path.join(SCRIPTS, "param_ligand.sh"),
@@ -435,6 +488,103 @@ def param_ligand(manifest, cdir, cfg, force=True):
     if proc.returncode != 0:
         raise BuildError("ligand parameterization failed:\n" + tail(proc.stdout))
     return ligdir
+
+
+def _walltime_seconds(value):
+    """Convert a Torque HH:MM:SS / MM:SS / seconds string to seconds."""
+    try:
+        parts = [int(x) for x in str(value).split(":")]
+    except ValueError:
+        return 4 * 3600
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    return parts[0] if parts else 4 * 3600
+
+
+def param_ligand_pbs(manifest, cdir, cfg):
+    """Run antechamber/AM1-BCC as a CPU PBS job and wait for completion.
+
+    The job is submitted with ``param_ppn`` CPUs and OMP/MKL/OpenBLAS thread
+    counts set to the same value. ``run_param_ligand.pbs.in`` writes
+    ``param_status.txt`` in the ligand directory, which is the authoritative
+    success signal even when Torque job history is unavailable.
+    """
+    prep = manifest["prepared"]
+    resname = manifest["ligand"].get("resname", "LIG")
+    ligdir = os.path.join(cdir, "ligands", resname)
+    os.makedirs(ligdir, exist_ok=True)
+    status_file = os.path.join(ligdir, "param_status.txt")
+    if os.path.exists(status_file):
+        os.remove(status_file)
+    label = os.path.basename(cdir)
+    name = job_name(label, 1, "a")
+    script = os.path.join(ligdir, "run_param.pbs")
+    values = {
+        "JOB_NAME": name,
+        "QUEUE": cfg["pbs_queue"],
+        "NODES": str(cfg.get("param_nodes") or cfg["pbs_nodes"]),
+        "PPN": str(int(cfg["param_ppn"])),
+        "WALLTIME": cfg["param_walltime"],
+        "JOIN": cfg["pbs_join"],
+        "MAIL": cfg["pbs_mail"],
+        "LOG_DIR": os.path.join(cdir, "logs") + os.sep,
+        "AMBER_SH": cfg.get("param_amber_sh") or cfg["amber_sh"],
+        "KIT_DIR": KIT_DIR,
+        "LIGAND_PDB": prep["ligand_prepared"],
+        "CHARGE": str(manifest["ligand"]["charge"]),
+        "RESNAME": resname,
+        "GAFF": "gaff2",
+        "OUTDIR": ligdir,
+    }
+    render_pbs(os.path.join(PBS_DIR, "run_param_ligand.pbs.in"), script, values)
+    proc = run(qsub_cmd() + [script], cwd=cdir)
+    if proc.returncode != 0:
+        raise BuildError("qsub failed for ligand parameterization:\n" +
+                         tail(proc.stdout))
+    try:
+        jobid = parse_jobid(proc.stdout)
+    except SubmissionError as exc:
+        raise BuildError(str(exc)) from exc
+    log_file = os.path.join(cdir, "logs",
+                            f"{name}.o{jobid.split('.')[0]}")
+    note(f"submitted ligand parameterization PBS job {jobid} "
+         f"(ppn={int(cfg['param_ppn'])}); waiting for it to finish")
+    deadline = time.time() + _walltime_seconds(cfg["param_walltime"]) + 3600
+    missing = 0
+    while time.time() < deadline:
+        if os.path.isfile(status_file):
+            try:
+                with open(status_file, encoding="utf-8") as fh:
+                    rc = int(fh.read().strip() or "1")
+            except ValueError:
+                rc = 1
+            if rc == 0:
+                return ligdir
+            raise BuildError(
+                f"ligand parameterization PBS job {jobid} failed (rc={rc}); "
+                f"see {log_file} and {ligdir}/antechamber.log")
+        info = qstat_job(jobid)
+        if info is None:
+            # Job history may be disabled; the status file is the primary
+            # signal. Give NFS/qstat a grace period, then use output files.
+            time.sleep(5)
+            if os.path.isfile(status_file):
+                continue
+            missing += 1
+            if missing < 6:
+                continue
+            if (os.path.isfile(os.path.join(ligdir, "lig.mol2"))
+                    and os.path.isfile(os.path.join(ligdir, "lig.frcmod"))):
+                return ligdir
+            raise BuildError(
+                f"ligand parameterization PBS job {jobid} disappeared without "
+                f"a status file; see {log_file}")
+        missing = 0
+        time.sleep(10)
+    raise BuildError(
+        f"ligand parameterization PBS job {jobid} timed out; see {log_file}")
 
 
 def build_system(manifest, cdir, cfg, args):
@@ -462,6 +612,8 @@ def build_system(manifest, cdir, cfg, args):
               "--outdir", outdir, "--top-name", top_name,
               "--no-pdb4amber", "--extra-leap", prep["extra_leap"],
               "--force"]
+    if cfg.get("hmr"):
+        common += ["--hmr", "--hmr-mass", str(cfg["hmr_mass"])]
     if cfg["solvent"] == "explicit":
         common += ["--water", cfg["water"], "--box", cfg["box"],
                    "--pad", str(cfg["pad"])]
@@ -499,6 +651,13 @@ def build_system(manifest, cdir, cfg, args):
     inpcrd_path = os.path.join(outdir, f"{top_name}.inpcrd")
     if not os.path.isfile(top_path) or not os.path.isfile(inpcrd_path):
         raise BuildError(f"tleap did not produce {top_path}/{inpcrd_path}")
+    hmr = None
+    if cfg.get("hmr"):
+        hmr_path = os.path.join(outdir, "hmr_manifest.json")
+        if not os.path.isfile(hmr_path):
+            raise BuildError(f"HMR requested but no {hmr_path} was written")
+        with open(hmr_path, encoding="utf-8") as fh:
+            hmr = json.load(fh)
     return {
         "top_name": top_name,
         "prmtop": top_path,
@@ -506,6 +665,7 @@ def build_system(manifest, cdir, cfg, args):
         "outdir": outdir,
         "manifest": bman,
         "counterion": counterion,
+        "hmr": hmr,
     }
 
 
@@ -596,6 +756,8 @@ def write_compat(manifest, cdir, cfg, args):
         "PROD_CHUNK_NS": str(cfg["prod_ns"] / cfg["prod_chunks"]),
         "DT": str(cfg["dt"]),
         "TRAJ_INTERVAL_PS": str(cfg["traj_interval_ps"]),
+        "HMR": "1" if cfg.get("hmr") else "0",
+        "HMR_MASS": str(cfg.get("hmr_mass", 3.024)),
         "SEED_BASE": str(cfg["seed_base"]),
         "PBS_QUEUE": cfg["pbs_queue"],
         "PBS_NODES": str(cfg["pbs_nodes"]),
@@ -700,6 +862,8 @@ def setup_replicas(manifest, masks, cdir, cfg, args):
                "--dt", str(cfg["dt"]),
                "--traj-interval-ps", str(cfg["traj_interval_ps"]),
                "--force"]
+        if cfg.get("hmr"):
+            cmd += ["--hmr", "--hmr-mass", str(cfg["hmr_mass"])]
         if ligand:
             cmd += ["--ligand-resname", manifest["ligand"].get("resname", "LIG")]
         if cfg["solvent"] == "implicit":
@@ -722,7 +886,10 @@ def setup_replicas(manifest, masks, cdir, cfg, args):
             "JOIN": cfg["pbs_join"], "MAIL": cfg["pbs_mail"],
             "LOG_DIR": logdir, "AMBER_SH": cfg["amber_sh"],
         }
-        render_pbs(os.path.join(PBS_DIR, "run_equil.pbs.in"),
+        equil_template = ("run_equil_gpu_min.pbs.in"
+                          if cfg.get("min_engine") == "pmemd.cuda"
+                          else "run_equil.pbs.in")
+        render_pbs(os.path.join(PBS_DIR, equil_template),
                    os.path.join(repdir, "run_equil.pbs"),
                    dict(common, **{
                        "JOB_NAME": job_name(label, rep, "e"),
@@ -865,6 +1032,7 @@ def build_one(pdb, args, cfg, root, state):
                 "manifest": rel(build["manifest"], cdir),
                 "linkage": rel(linkage, cdir),
                 "counterion": build["counterion"],
+                "hmr": build.get("hmr"),
             },
             "masks": {
                 "restraint": masks.get("RESTRAINT_MASK", ""),
@@ -882,6 +1050,11 @@ def build_one(pdb, args, cfg, root, state):
         entry["errors"].append(str(exc))
         save_state(root, state)
         raise
+    except Exception as exc:
+        entry["status"] = "failed"
+        entry["errors"].append(f"unexpected {type(exc).__name__}: {exc}")
+        save_state(root, state)
+        raise BuildError(f"unexpected {type(exc).__name__}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -914,7 +1087,11 @@ def submit_chain(entry, cdir, rep, cfg, from_stage="equil", dry=False):
         cmd.append(os.path.basename(script))
         rendered = " ".join(shlex.quote(x) for x in cmd)
         if dry:
-            print(f"DRY-RUN: (cd {repdir} && {rendered})")
+            message = f"(cd {repdir} && {rendered})"
+            if JSON_MODE:
+                print(f"DRY-RUN: {message}", file=sys.stderr)
+            else:
+                sch_ui.emit("DRY-RUN", f"[DRY-RUN] {message}")
             jobid = f"DRYRUN-{entry['label']}-r{rep['rep']}-{stage}"
         else:
             proc = run(cmd, cwd=repdir)
@@ -930,10 +1107,13 @@ def submit_chain(entry, cdir, rep, cfg, from_stage="equil", dry=False):
             "state": "DRY" if dry else "Q",
             "submitted_at": now(),
         }
-        jobs[stage] = job
-        # Track each submitted job immediately: if a later qsub fails, the
-        # already-running jobs must still appear in campaign.json.
-        rep["jobs"] = [jobs[k] for k in stages if k in jobs]
+        # Dry runs must not mutate campaign state: only record jobs when a
+        # real qsub has produced a job id.
+        if not dry:
+            jobs[stage] = job
+            # Track each submitted job immediately: if a later qsub fails, the
+            # already-running jobs must still appear in campaign.json.
+            rep["jobs"] = [jobs[k] for k in stages if k in jobs]
         plan.append({"rep": rep["rep"], "kind": stage, "cwd": repdir,
                      "command": rendered, "jobid": jobid,
                      "depends_on": previous})
@@ -1255,11 +1435,12 @@ def cmd_inspect(args, cfg):
             results.append({"label": label, "type": data["classification"]["type"],
                             "confidence": data["classification"]["confidence"],
                             "errors": [], "json": out})
-            print(f"{label}: {data['classification']['type']} "
-                  f"({data['classification']['confidence']}) -> {out}")
+            if not args.json:
+                sch_ui.ok(f"{label}: {data['classification']['type']} "
+                          f"({data['classification']['confidence']}) -> {out}")
         except BuildError as exc:
             failed = True
-            print(f"{label}: ERROR\n{exc}", file=sys.stderr)
+            sch_ui.error(f"{label}: {exc}")
             results.append({"label": label, "error": str(exc), "json": out})
     if args.json:
         print(json.dumps(results, indent=2))
@@ -1280,15 +1461,21 @@ def cmd_build_or_run(args, cfg, submit):
         try:
             entry = build_one(os.path.abspath(pdb), args, cfg, root, state)
             entries.append(entry)
-            print(f"{entry['label']}: built ({entry['type']})")
+            if not args.json:
+                sch_ui.ok(f"{entry['label']}: built ({entry['type']})")
         except BuildError as exc:
             failures += 1
-            print(f"error: {os.path.basename(pdb)}: {exc}", file=sys.stderr)
+            sch_ui.error(f"{os.path.basename(pdb)}: {exc}")
+        except Exception as exc:
+            failures += 1
+            traceback.print_exc()
+            sch_ui.error(f"{os.path.basename(pdb)}: unexpected "
+                         f"{type(exc).__name__}: {exc}")
     if submit and not args.no_submit:
         if failures and not args.submit_partial:
-            print("not submitting any job because at least one complex failed; "
-                  "use --submit-partial to submit the successful ones",
-                  file=sys.stderr)
+            sch_ui.warn("not submitting any job because at least one complex "
+                        "failed; use --submit-partial to submit the successful "
+                        "ones")
         else:
             plan = []
             for entry in entries:
@@ -1302,7 +1489,7 @@ def cmd_build_or_run(args, cfg, submit):
                     entry["status"] = "submit-failed"
                     entry["errors"].append(str(exc))
                     failures += 1
-                    print(f"error: {entry['label']}: {exc}", file=sys.stderr)
+                    sch_ui.error(f"{entry['label']}: {exc}")
             save_state(root, state)
             if args.dry_run:
                 with open(os.path.join(root, "submission_plan.json"), "w",
@@ -1319,6 +1506,13 @@ def cmd_build_or_run(args, cfg, submit):
              "status": e.get("status"), "errors": e.get("errors", []),
              "dir": os.path.join(root, "complexes", e.get("label", ""))}
             for e in result], indent=2))
+    else:
+        sch_ui.next_steps(
+            "ok" if not failures else "error",
+            [f"amber-auto status --campaign {root} --queue",
+             f"amber-auto report --campaign {root}",
+             f"amber-auto resume --campaign {root}"],
+            footer=[f"campaign: {root}"])
     if failures:
         sys.exit(5 if len(entries) > failures else 3)
 
@@ -1331,6 +1525,7 @@ def cmd_status(args, cfg):
     if args.json:
         print(json.dumps({"campaign": root, "systems": rows}, indent=2))
     else:
+        sch_ui.kv("Campaign", root, 10)
         print_status(rows, queue=args.queue)
     if args.queue and not args.json:
         pass
@@ -1344,10 +1539,11 @@ def cmd_report(args, cfg):
     _, srows = collect_status(root, cfg)
     status_map = {(r["complex"], r["rep"]): r for r in srows}
     rows = write_report(root, state, status_map)
-    print(f"wrote {os.path.join(root, 'report', 'summary.tsv')}")
-    print(f"wrote {os.path.join(root, 'report', 'report.md')}")
     if args.json:
         print(json.dumps(rows, indent=2))
+    else:
+        sch_ui.ok(f"wrote {os.path.join(root, 'report', 'summary.tsv')}")
+        sch_ui.ok(f"wrote {os.path.join(root, 'report', 'report.md')}")
 
 
 def cmd_resume(args, cfg):
@@ -1361,7 +1557,7 @@ def cmd_resume(args, cfg):
         if args.complex and entry["label"] != args.complex:
             continue
         if entry.get("status") == "failed":
-            print(f"{entry['label']}: skipped (build failed)", file=sys.stderr)
+            sch_ui.warn(f"{entry['label']}: skipped (build failed)")
             continue
         cdir = os.path.join(root, "complexes", entry["label"])
         for rep in entry.get("replicas", []):
@@ -1378,7 +1574,7 @@ def cmd_resume(args, cfg):
                     active = True
                     break
             if active and not args.force:
-                print(f"{entry['label']} r{rep['rep']}: job still active; skip")
+                sch_ui.info(f"{entry['label']} r{rep['rep']}: job still active; skip")
                 continue
             npt = os.path.isfile(os.path.join(repdir, "npt.rst7"))
             prod = os.path.isfile(os.path.join(repdir, "prod_final.rst7"))
@@ -1392,20 +1588,26 @@ def cmd_resume(args, cfg):
             elif not post:
                 from_stage = "post"
             else:
-                print(f"{entry['label']} r{rep['rep']}: complete")
+                sch_ui.ok(f"{entry['label']} r{rep['rep']}: complete")
                 continue
-            print(f"{entry['label']} r{rep['rep']}: resubmit from {from_stage}")
+            sch_ui.info(f"{entry['label']} r{rep['rep']}: resubmit from {from_stage}")
             try:
                 plans.extend(submit_chain(entry, cdir, rep, cfg,
                                           from_stage=from_stage,
                                           dry=args.dry_run))
-                entry["status"] = "submitted"
+                if not args.dry_run:
+                    entry["status"] = "submitted"
             except SubmissionError as exc:
                 failures += 1
                 entry["status"] = "submit-failed"
-                print(f"error: {entry['label']} r{rep['rep']}: {exc}",
-                      file=sys.stderr)
-    save_state(root, state)
+                sch_ui.error(f"{entry['label']} r{rep['rep']}: {exc}")
+    if not args.dry_run:
+        save_state(root, state)
+        sch_ui.next_steps(
+            "ok" if not failures else "error",
+            [f"amber-auto status --campaign {root} --queue",
+             f"amber-auto report --campaign {root}"],
+            footer=[f"campaign: {root}"])
     if failures:
         sys.exit(4)
     if args.dry_run:
@@ -1473,12 +1675,42 @@ def add_build_options(p):
     p.add_argument("--prod-chunks", type=int, default=None)
     p.add_argument("--dt", type=float, default=None)
     p.add_argument("--traj-interval-ps", type=float, default=None)
+    p.add_argument("--hmr", dest="hmr", action="store_true", default=None,
+                   help="HMR: repartition non-water hydrogen masses "
+                        "(default: config; use with --dt 0.004)")
+    p.add_argument("--no-hmr", dest="hmr", action="store_false", default=None,
+                   help="disable HMR")
+    p.add_argument("--hmr-mass", type=float, default=None,
+                   help="new non-water hydrogen mass in Da (default 3.024)")
     p.add_argument("--pbs-queue", default=None)
     p.add_argument("--pbs-nodes", default=None,
                    help="Torque nodes spec (default 1); use a node name "
                         "(e.g. node02) to pin a job or avoid a bad node")
     p.add_argument("--ppn", type=int, default=None)
     p.add_argument("--gpus", type=int, default=None)
+    p.add_argument("--param-pbs", dest="param_pbs", action="store_true",
+                   default=None,
+                   help="run ligand AM1-BCC parameterization as a PBS job "
+                        "(default: site config)")
+    p.add_argument("--no-param-pbs", dest="param_pbs", action="store_false",
+                   default=None,
+                   help="run ligand parameterization locally (no PBS)")
+    p.add_argument("--param-ppn", type=int, default=None,
+                   help="CPUs requested by the parameterization PBS job "
+                        "(default 40)")
+    p.add_argument("--param-walltime", default=None,
+                   help="walltime for the parameterization PBS job "
+                        "(default 04:00:00)")
+    p.add_argument("--param-amber-sh", default=None,
+                   help="amber.sh used for ligand parameterization "
+                        "(default: amber_sh; use a conda AmberTools env "
+                        "for OpenBLAS-threaded sqm)")
+    p.add_argument("--param-nodes", default=None,
+                   help="Torque nodes spec for the parameterization job "
+                        "(default: pbs_nodes; use 1 to let the scheduler pick)")
+    p.add_argument("--min-engine", default=None, choices=["sander", "pmemd.cuda"],
+                   help="minimization engine: sander.MPI (default) or "
+                        "pmemd.cuda (faster for large systems)")
     p.add_argument("--equil-walltime", default=None)
     p.add_argument("--prod-walltime", default=None)
     p.add_argument("--post-walltime", default=None)
@@ -1496,10 +1728,13 @@ def add_build_options(p):
 
 
 def main():
-    global VERBOSE
+    global VERBOSE, JSON_MODE
+    argv = sch_ui.extract_color_arg(sys.argv[1:])
     ap = argparse.ArgumentParser(
         description="One-command Amber MD for protein-ligand/peptide/antibody complexes",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Color: --color=auto|always|never (default auto; logs and "
+               "machine-readable output are always plain).")
     sub = ap.add_subparsers(dest="command", required=True)
 
     p_inspect = sub.add_parser("inspect", help="classify complexes without building")
@@ -1550,8 +1785,10 @@ def main():
     p_resume.add_argument("--force", action="store_true")
     p_resume.set_defaults(func=lambda a: cmd_resume(a, load_config(a)))
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     VERBOSE = bool(getattr(args, "verbose", False))
+    JSON_MODE = bool(getattr(args, "json", False))
+    os.environ.setdefault("UI_CMD_PREFIXES", "amber-")
     args.func(args)
 
 
