@@ -82,17 +82,24 @@ stage_done() {
 
 run_stage() {
   local s=$1 prev=$2
-  echo "=== RUN $s (prev=$prev) $(date) ==="
+  local ref="$CRD"
+  # NPT 加热/平衡后盒子会从 tleap 初始盒子变化到平衡密度。释放阶段如果仍用
+  # 原始 complex.inpcrd 作 -ref，restart 时的 restraint 能量会突增（本项目
+  # 实测 ~1.9e5 kcal/mol），压力/盒子随之突变，pmemd.cuda 报
+  # "Periodic box dimensions have changed too much" 并中止。释放阶段改用
+  # 上一 stage 的 restart 作参考，使参考结构与当前盒子一致，从 0 逐步释放。
+  [[ "$s" == 04* ]] && ref="$prev"
+  echo "=== RUN $s (prev=$prev, ref=$ref) $(date) ==="
   # 只清当前未完成 stage；不动已完成的 stage
   rm -f "$s.rst7" "$s.out" "$s.nc" "$s.mdinfo" "$s.log"
   if [[ "$s" == 01_* || "$s" == 02_* ]]; then
     "{{MPIRUN}}" -np "{{PPN}}" sander.MPI -O \
       -i "$s.in" -o "$s.out" -p "$TOP" \
-      -c "$prev" -ref "$CRD" -r "$s.rst7" -inf "$s.mdinfo"
+      -c "$prev" -ref "$ref" -r "$s.rst7" -inf "$s.mdinfo"
   else
     pmemd.cuda -O \
       -i "$s.in" -o "$s.out" -p "$TOP" \
-      -c "$prev" -ref "$CRD" -r "$s.rst7" -x "$s.nc" \
+      -c "$prev" -ref "$ref" -r "$s.rst7" -x "$s.nc" \
       -inf "$s.mdinfo" -l "$s.log"
   fi
   local rc=$?

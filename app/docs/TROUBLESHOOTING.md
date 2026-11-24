@@ -126,6 +126,17 @@ bond com.26.SG com.84.SG
 
 `Periodic box dimensions have changed too much`
 
+先看 `04b.out` 的 `RESTRAINT =`：若它在读取 restart 后立刻很大（~1e5 kcal/mol），
+是 restraint 参考坐标与当前盒子不一致。04a 的 NPT 已把盒子从 tleap 初始值压到
+平衡密度，而 `-ref complex.inpcrd` 仍是旧盒子中的坐标；restart 时 restraint 能量
+突增，压力/盒子随之突变，GPU 代码中止。模板现在让释放阶段（`04*`）用上一 stage
+的 restart 作 `-ref`，参考结构与当前盒子一致。
+
+旧 campaign 的补救：用 04a 末帧生成 `npt_ref.rst7`，并把释放阶段的 `-ref` 指向它
+（参考结构固定为平衡后的构象）。
+
+其他原因/缓解：
+
 - 用更短的 NPT release stage（`RELEASE_NS=0.1`、`RELEASE_STAGES=100`）；
 - 或先用 CPU `sander.MPI` 平衡密度；
 - 增大 `PAD`、减小 `cut`。

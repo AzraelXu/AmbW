@@ -84,19 +84,23 @@ stage_done() {
 
 run_stage() {
   local s=$1 prev=$2
-  echo "=== RUN $s (prev=$prev) $(date) ==="
+  local ref="$CRD"
+  # NPT 后盒子已变化；释放阶段用上一 stage 的 restart 作参考，避免 restart
+  # 时 restraint 能量突增导致 pmemd.cuda 的 box 检查中止。详见 run_equil.pbs.in。
+  [[ "$s" == 04* ]] && ref="$prev"
+  echo "=== RUN $s (prev=$prev, ref=$ref) $(date) ==="
   # 只清当前未完成 stage；不动已完成的 stage
   rm -f "$s.rst7" "$s.out" "$s.nc" "$s.mdinfo" "$s.log"
   if [[ "$s" == 01_* || "$s" == 02_* ]]; then
     # GPU minimization: pmemd.cuda supports imin=1; ntwx=0 so no -x.
     pmemd.cuda -O \
       -i "$s.in" -o "$s.out" -p "$TOP" \
-      -c "$prev" -ref "$CRD" -r "$s.rst7" \
+      -c "$prev" -ref "$ref" -r "$s.rst7" \
       -inf "$s.mdinfo" -l "$s.log"
   else
     pmemd.cuda -O \
       -i "$s.in" -o "$s.out" -p "$TOP" \
-      -c "$prev" -ref "$CRD" -r "$s.rst7" -x "$s.nc" \
+      -c "$prev" -ref "$ref" -r "$s.rst7" -x "$s.nc" \
       -inf "$s.mdinfo" -l "$s.log"
   fi
   local rc=$?
